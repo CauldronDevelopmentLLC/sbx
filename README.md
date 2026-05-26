@@ -55,8 +55,13 @@ To create a sandbox from a template:
 
 Templates live in ``~/.local/share/sbx-templates/<template>/`` and consist
 of a ``config.yml`` and an optional ``home/`` directory whose contents are
-copied into the new sandbox's home.  See ``sbx template`` below for creating
-templates from existing sandboxes.
+copied into the new sandbox's home.  Any other files in the template
+directory (e.g. hook scripts) are copied verbatim into the sandbox config
+directory.  See ``sbx template`` below for creating templates from existing
+sandboxes.
+
+When creating a sandbox with ``-t``, ``--rule`` and command overrides are
+not allowed; the template is copied as-is.
 
 You can edit the sandbox config with:
 
@@ -68,6 +73,9 @@ correctly.
 Finally, run your sandbox:
 
     sbx run <name> <args>...
+
+``sbx run`` propagates the sandboxed command's exit code (a non-zero
+``post-hook`` exit code takes precedence).
 
 To save an existing sandbox as a reusable template:
 
@@ -100,9 +108,9 @@ and not to ``sbx`` then you will need to add ``--`` like this:
 ``sbx`` takes one of the following subcommands:
 
     create       create a new sandbox
-    reconfig     reconfigure an existing sandbox
     run          run an existing sandbox
     list         list existing sandboxes
+    ps           list running sandboxes
     list-rules   list available rules
     delete       delete an existing sandbox
     show         print sandbox config and exit
@@ -117,12 +125,16 @@ To see the help for a subcommand run:
 # Configuration
 
 sbx uses a [YAML](https://yaml.org/) configuration file.  A config
-consists of a top-level dictionary containing up to 4 keys, as follows:
+consists of a top-level dictionary containing any of the following keys:
 
-- ``use``     - A list of rules to use by default.
-- ``command`` - A list containing the default command and any arguments.
-- ``imports`` - A list of paths to other configs to import rules from.
-- ``rules``   - A dictionary containing all the applicable rules.
+- ``use``         - A list of rules to use by default.
+- ``command``     - A list containing the default command and any arguments.
+- ``imports``     - A list of paths to other configs to import rules from.
+- ``rules``       - A dictionary containing all the applicable rules.
+- ``create-hook`` - Shell command run after the sandbox is created.
+- ``pre-hook``    - Shell command run before the sandbox command starts.
+- ``post-hook``   - Shell command run after the sandbox command exits.
+- ``delete-hook`` - Shell command run before the sandbox is deleted.
 
 For example:
 
@@ -228,6 +240,31 @@ action.
 Of course, the above example is not very useful.  You need more
 complicated rules in most cases.  Many useful rules are already defined in
 ``global.yml``.
+
+## Hooks
+
+The ``create-hook``, ``pre-hook``, ``post-hook`` and ``delete-hook`` keys
+specify shell commands that run on the host (outside the sandbox) at the
+named lifecycle points:
+
+- ``create-hook`` runs after ``sbx create`` writes the sandbox config.
+- ``pre-hook``    runs before ``sbx run`` starts the sandboxed command.
+- ``post-hook``   runs after the sandboxed command exits.  The exit code
+  is available as ``$SANDBOX_EXIT_CODE``.
+- ``delete-hook`` runs before ``sbx delete`` removes any files.
+
+Hooks are run with ``bash -c`` and inherit the parent environment plus
+``SANDBOX``, ``SANDBOX_HOME``, ``SANDBOX_CONFIG`` and ``SANDBOX_ROOT``.
+The sandbox config directory is prepended to ``PATH`` so hook scripts
+shipped alongside ``config.yml`` (for example via a template) can be
+invoked by name.  A non-zero hook exit code aborts the operation.
+
+Example:
+
+```yaml
+pre-hook: setup.sh
+post-hook: cleanup.sh "$SANDBOX_EXIT_CODE"
+```
 
 ### Action: ``args: [<arg>...]``
 A list of arbitrary additional arguments to pass to ``bwrap``.
@@ -354,6 +391,18 @@ Example:
 rules:
   example:
     - file: ['Hello World!', 'hello.txt']
+```
+
+### Action: ``hide: <path> | [<path>...]``
+Hide one or more host paths from the sandbox.  Directories are masked with
+a ``tmpfs``; files are masked with a read-only bind of ``/dev/null``.
+Missing paths are silently skipped.
+
+Example:
+```yaml
+rules:
+  example:
+    - hide: [$HOME/.ssh, $HOME/.gnupg]
 ```
 
 ### Action: ``ifdef: [<var>, <action>...]``
