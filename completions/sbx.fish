@@ -25,6 +25,7 @@ complete -x -c sbx -n __fish_use_subcommand -a list-rules -d 'List available rul
 complete -x -c sbx -n __fish_use_subcommand -a reconfig -d 'Reconfigure an existing sandbox'
 complete -x -c sbx -n __fish_use_subcommand -a run -d 'Run an existing sandbox'
 complete -x -c sbx -n __fish_use_subcommand -a show -d 'Print sandbox config and exit'
+complete -x -c sbx -n __fish_use_subcommand -a enter -d 'Enter a running sandbox'
 complete -x -c sbx -n __fish_use_subcommand -a template -d 'Create a template from an existing sandbox'
 
 # Options for 'create' subcommand
@@ -48,6 +49,9 @@ complete -f -c sbx -n '__fish_seen_subcommand_from run' -s C -l command -d 'Over
 
 # Options for 'template' subcommand
 complete -f -c sbx -n '__fish_seen_subcommand_from template' -s f -l force -d 'Overwrite existing template'
+
+# Options for 'enter' subcommand
+complete -f -c sbx -n '__fish_seen_subcommand_from enter' -s r -l root -d 'Enter as root'
 
 # Subcommands that take a sandbox name
 for cmd in delete edit reconfig run show template

@@ -3,7 +3,7 @@ _sbx_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  CMDS="create reconfig run list list-rules delete show edit template help"
+  CMDS="create reconfig run list list-rules delete show edit enter template help"
   SBCMDS="reconfig run delete show edit template"
   TPLDIR="${XDG_DATA_HOME:-$HOME/.local/share}/sbx-templates"
 

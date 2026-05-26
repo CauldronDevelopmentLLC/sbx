@@ -7,11 +7,11 @@ import tempfile
 import yaml
 import shlex
 import shutil
-import re
 import fcntl
 import random
 import subprocess
 from functools import reduce
+from collections import defaultdict
 
 
 XDG_CONFIG_HOME = os.environ.get('XDG_CONFIG_HOME', '$HOME/.config')
@@ -71,6 +71,11 @@ def copytree(src, dst):
       if not os.path.exists(tgtPath):
         #print('{} -> {}'.format(os.path.join(root, file), tgtPath))
         shutil.copy2(os.path.join(root, file), tgtPath)
+
+
+def get_pid_ns(pid = os.getpid()):
+  link = os.readlink(f'/proc/{pid}/ns/pid')
+  return link.split('[')[-1].rstrip(']')
 
 
 class SBX:
@@ -603,25 +608,54 @@ class SBX:
 
 
   def ps(self):
-    try:
-      out = subprocess.check_output(['pgrep', '-x', 'bwrap']).decode()
-    except subprocess.CalledProcessError: return
+    # Dictionary to group processes by their PID namespace inode
+    ns_groups = defaultdict(list)
+    our_ns_inode = get_pid_ns()
 
-    entries = []
-    for pid in out.split():
+    # Iterate through all entries in /proc
+    for pid_dir in os.listdir('/proc'):
+      if not pid_dir.isdigit(): continue
+
+      pid = int(pid_dir)
+      path = f'/proc/{pid}'
+
       try:
-        with open(f'/proc/{pid}/environ', 'rb') as f:
-          env = f.read().split(b'\0')
-      except (FileNotFoundError, PermissionError): continue
+        # Check if the process name is 'bwrap'
+        with open(f'{path}/comm', 'r', errors='ignore') as f:
+          if f.read().strip() != 'bwrap': continue
 
-      name = None
-      root_pid = None
-      for var in env:
-        if   var.startswith(b'SANDBOX='):      name     = var[8:].decode()
-        elif var.startswith(b'SBX_ROOT_PID='): root_pid = var[13:].decode()
+        # Filter by the environment variable SBX_ROOT_PID
+        name  = None
+        valid = False
+        with open(f'{path}/environ', 'r', errors = 'ignore') as f:
+          env = f.read().split('\0')
+          for var in env:
+            if   var.startswith('SANDBOX='):      name  = var[8:]
+            elif var.startswith('SBX_ROOT_PID='): valid = True
 
-      if name and root_pid == pid:
-        entries.append((name, pid))
+        if valid is None: continue
+
+        # Get the PID namespace identifier
+        ns_inode = get_pid_ns(pid)
+        if ns_inode == our_ns_inode: continue
+
+        # Get the process start time to determine age
+        with open(f'{path}/stat', 'r', errors='ignore') as f:
+          stat_fields = f.read().split()
+          # Use field 21 (0-indexed) which corresponds to the 22nd field
+          start_time = int(stat_fields[21])
+
+        # Group the verified process
+        ns_groups[ns_inode].append((pid, start_time, name))
+
+      except (FileNotFoundError, ProcessLookupError, PermissionError,
+              IndexError, ValueError): continue
+
+    # Extract the oldest PID from each shared PID namespace group
+    entries = []
+    for ns_inode, procs in ns_groups.items():
+      procs.sort(key = lambda x: x[1])
+      entries.append((procs[0][2], procs[0][0]))
 
     width = max((len(str(p)) for _, p in entries), default = 4)
     print(f'{"PID":<{width}} SANDBOX')
@@ -693,6 +727,34 @@ class SBX:
     os.execvp(cmd[0], cmd)
 
 
+  def enter(self):
+    tpid = str(self.args.pid)
+    stat = os.stat(f'/proc/{tpid}')
+    tuid = str(stat.st_uid)
+    tgid = str(stat.st_gid)
+    tcwd = os.readlink(f'/proc/{tpid}/cwd')
+    cmd  = []
+
+    if os.getuid():
+      if not shutil.which('sudo'):
+        raise SBError('"sudo" not found on PATH')
+
+      cmd += ['sudo']
+
+    if not shutil.which('nsenter'):
+      raise SBError('"nsenter" not found on PATH')
+
+    cmd += ['nsenter', '-t', tpid, '-e']
+
+    if self.args.root:
+      cmd += ['--mount', '--uts', '--ipc', '--net', '--pid']
+    else: cmd += ['-a', '-S', tuid, '-G', tgid]
+
+    cmd += ['/bin/bash', '-c', f'cd "{tcwd}" && exec /bin/bash -l']
+
+    os.execvp(cmd[0], cmd)
+
+
   def exec(self):
     if hasattr(self.args, 'name'):
       os.environ['SANDBOX']        = self.args.name
@@ -743,18 +805,15 @@ subs.add_parser('ps',   help = 'list running sandboxes')
 lr_parser = subs.add_parser('list-rules', help = 'list available rules')
 lr_parser.add_argument('--config', '-c', help = 'override the default config')
 
-del_parser = subs.add_parser(
-  'delete', help = 'delete an existing sandbox')
+del_parser = subs.add_parser('delete', help = 'delete an existing sandbox')
 del_parser.add_argument('name', help = 'name of the sandbox')
 del_parser.add_argument(
   '--force', '-f', action = 'store_true', help = 'delete without asking')
 
-show_parser = subs.add_parser(
-  'show', help = 'print sandbox config and exit')
+show_parser = subs.add_parser('show', help = 'print sandbox config and exit')
 show_parser.add_argument('name', help = 'name of the sandbox')
 
-edit_parser = subs.add_parser(
-  'edit', help = 'edit sandbox config')
+edit_parser = subs.add_parser('edit', help = 'edit sandbox config')
 edit_parser.add_argument('name', help = 'name of the sandbox')
 
 tpl_parser = subs.add_parser(
@@ -764,6 +823,11 @@ tpl_parser.add_argument('template_name', help = 'name of the new template')
 tpl_parser.add_argument(
   '--force', '-f', action = 'store_true',
   help = 'overwrite the template if it already exists')
+
+ent_parser = subs.add_parser('enter', help = 'enter a running container')
+ent_parser.add_argument('pid', type = int, help = 'Process ID')
+ent_parser.add_argument(
+  '--root', '-r', action = 'store_true', help = 'enter as root user')
 
 subs.add_parser('help', help = 'show this help message and exit')
 

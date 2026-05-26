@@ -111,6 +111,7 @@ and not to ``sbx`` then you will need to add ``--`` like this:
     run          run an existing sandbox
     list         list existing sandboxes
     ps           list running sandboxes
+    enter        enter a running sandbox
     list-rules   list available rules
     delete       delete an existing sandbox
     show         print sandbox config and exit
