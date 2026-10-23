@@ -1,21 +1,29 @@
-PREFIX   ?= $(HOME)/.local
-CONFIG   ?= $(or $(XDG_CONFIG_HOME),$(HOME)/.config)/sbx
+PREFIX   ?= /usr/local
+BIN      := $(DESTDIR)$(PREFIX)/bin
+LIB      := $(DESTDIR)$(PREFIX)/lib/sbx
+BASH     := $(DESTDIR)$(PREFIX)/share/bash-completion/completions
+FISH     := $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d
 PROGRAMS := sbx sbx-portal sbx-x11
 
-install:
-	install -d $(PREFIX)/bin $(CONFIG)
-	install -m 755 $(PROGRAMS) $(PREFIX)/bin
-	@if [ ! -e $(CONFIG)/global.yml ]; then \
-	  install -m 644 global.yml $(CONFIG); \
-	elif ! cmp -s global.yml $(CONFIG)/global.yml; then \
-	  echo "$(CONFIG)/global.yml differs, see:" \
-	    "diff -u $(CONFIG)/global.yml global.yml"; \
-	fi
+install: root
+	install -d $(BIN) $(LIB) $(BASH) $(FISH)
+	install -m 755 $(PROGRAMS) $(BIN)
+	install -m 644 global.yml $(LIB)
+	rm -rf $(LIB)/templates
+	cp -R templates $(LIB)
+	chmod -R u+w,go-w,a+rX $(LIB)/templates
+	install -m 644 completions/sbx.completion $(BASH)/sbx
+	install -m 644 completions/sbx.fish $(FISH)/sbx.fish
 
-uninstall:
-	rm -f $(addprefix $(PREFIX)/bin/,$(PROGRAMS))
+uninstall: root
+	rm -f $(addprefix $(BIN)/,$(PROGRAMS)) $(BASH)/sbx $(FISH)/sbx.fish
+	rm -rf $(LIB)
+
+root:
+	@[ "$$(id -u)" = 0 ] || { echo 'Run as root, e.g. "sudo make install"' >&2; \
+	  exit 1; }
 
 check:
 	tests/sbx-x11
 
-.PHONY: install uninstall check
+.PHONY: install uninstall root check

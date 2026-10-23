@@ -1,0 +1,24 @@
+#!/bin/bash
+# Installs or updates Visual Studio Code in $SBX_APPS/vscode
+app=vscode
+. "$SBX_LIB/templates/app.sh"
+
+api=https://update.code.visualstudio.com/api/update
+info=$(curl -fsS --proto =https \
+  "$api/linux-$(arch x64 arm64)/stable/latest" |
+  python3 -c '
+import json, sys
+info = json.load(sys.stdin)
+print(info["url"], info["productVersion"], info["sha256hash"])')
+read -r url version sha <<< "$info"
+
+check "$version"
+
+fetch "$url" "$tmp/code.tar.gz"
+log "Verifying"
+echo "$sha  $tmp/code.tar.gz" | sha256sum -c --quiet
+
+log "Unpacking"
+mkdir "$tmp/unpacked"
+tar -xzf "$tmp/code.tar.gz" -C "$tmp/unpacked"
+activate "$version" "$(root "$tmp/unpacked")"

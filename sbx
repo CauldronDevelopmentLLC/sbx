@@ -31,6 +31,7 @@ SANDBOX_ROOT      = f'{XDG_CONFIG_HOME}/sbx'
 SANDBOX_HOME      = f'{XDG_DATA_HOME}/sbx/$SANDBOX'
 SANDBOX_CONFIG    = f'{SANDBOX_ROOT}/$SANDBOX/config.yml'
 SANDBOX_TEMPLATES = f'{XDG_DATA_HOME}/sbx-templates'
+SANDBOX_APPS      = f'{XDG_DATA_HOME}/sbx-apps' # Shared by templates
 DEFAULT_CONFIG    = f'{SANDBOX_ROOT}/global.yml'
 APP_BASE       = 'org.sbx'
 SECCOMP_GROUPS = ('sockets', 'io-uring', 'keyring', 'userns')
@@ -110,6 +111,16 @@ def parse_allow_net(s):
   else: addr, port = s, ''
 
   return ipaddress.ip_network(addr), int(port) if port else None
+
+
+def find_lib():
+  '''sbx's system files, in <prefix>/lib/sbx or, in a checkout, next to sbx.'''
+  bin = os.path.dirname(os.path.realpath(__file__))
+  lib = os.path.normpath(f'{bin}/../lib/sbx')
+  return lib if os.path.isdir(lib) else bin
+
+
+SBX_LIB = find_lib()
 
 
 def get_pid_ns(pid = os.getpid()):
@@ -862,19 +873,11 @@ class SBX:
     if self.args.template and (self.args.rule or self.args.command):
       raise SBError('--template cannot be combined with --rule or command')
 
+    if self.args.template: template_dir = self.find_template(self.args.template)
     config_dir = os.path.dirname(sandbox_config)
     os.makedirs(config_dir, exist_ok = True)
 
     if self.args.template:
-      template_dir = self.expand_path(
-        f'{SANDBOX_TEMPLATES}/{self.args.template}')
-      if not os.path.isdir(template_dir):
-        raise SBError(f'Template "{self.args.template}" not found')
-
-      template_config = f'{template_dir}/config.yml'
-      if not os.path.isfile(template_config):
-        raise SBError(f'Template "{self.args.template}" missing config.yml')
-
       # Copy template contents verbatim (config.yml, hook scripts, etc.)
       # Skip 'home/' which is seeded separately into SANDBOX_HOME.
       for entry in os.listdir(template_dir):
@@ -899,10 +902,10 @@ class SBX:
 
     else:
       # --config or default: synthesize config_data, inline or import rules
-      config = self.args.config if self.args.config else DEFAULT_CONFIG
+      config = self.args.config if self.args.config else self.default_config()
       self.load_config(config)
 
-      command = self.args.command or self.config.get('command', ['bash'])
+      command =self.args.command or self.config.get('command', ['bash'])
       rules   = self.args.rule    or self.config.get('use', [])
       config_data = dict(use = rules, command = command)
 
@@ -932,7 +935,7 @@ class SBX:
 
   def list_rules(self):
     # Load default config
-    config = self.args.config if self.args.config else DEFAULT_CONFIG
+    config = self.args.config if self.args.config else self.default_config()
     self.load_config(config)
 
     width = reduce(lambda x, name: max(len(name), x), self.rules, 0)
@@ -1039,6 +1042,53 @@ class SBX:
       if not response.lower() in ('yes', 'y'): return
 
     for path in paths: shutil.rmtree(path)
+
+
+  def update(self):
+    self.require_config()
+    self.load_config(SANDBOX_CONFIG)
+    if not self.config.get('update-hook'):
+      raise SBError(f'Sandbox "{self.args.name}" has no "update-hook"')
+    sys.exit(self.run_hook('update-hook'))
+
+
+  def rename(self):
+    old, new = self.args.name, self.args.new_name
+    if not new or '/' in new or new.startswith('.'):
+      raise SBError(f'Invalid sandbox name "{new}"')
+    self.require_config()
+    if any(name == old for name, _ in self.running()):
+      raise SBError(f'Sandbox "{old}" is running')
+
+    moves = []
+    for path in (os.path.dirname(SANDBOX_CONFIG), SANDBOX_HOME):
+      src, dst = (self.expand_path(path.replace('$SANDBOX', name))
+                  for name in (old, new))
+      if os.path.exists(dst): raise SBError(f'"{dst}" already exists')
+      if os.path.exists(src): moves.append((src, dst))
+
+    for src, dst in moves:
+      self.log(f'Moving "{src}" to "{dst}"')
+      os.rename(src, dst)
+
+
+  def default_config(self):
+    '''The user's global.yml, or the one installed with sbx.'''
+    if os.path.exists(self.expand_path(DEFAULT_CONFIG)): return DEFAULT_CONFIG
+    return '$SBX_LIB/global.yml'
+
+
+  def find_template(self, name):
+    '''User templates first, so they can replace those installed with sbx.'''
+    roots = (self.expand_path(SANDBOX_TEMPLATES), f'{SBX_LIB}/templates')
+    for root in roots:
+      if os.path.isfile(f'{root}/{name}/config.yml'): return f'{root}/{name}'
+
+    names = sorted({n for root in roots if os.path.isdir(root)
+                    for n in os.listdir(root)
+                    if os.path.isfile(f'{root}/{n}/config.yml')})
+    raise SBError(f'Template "{name}" not found, available: ' +
+                  (', '.join(names) or 'none'))
 
 
   def show(self):
@@ -1154,6 +1204,8 @@ class SBX:
       os.environ['APP_NAME']       = f'{APP_BASE}.{self.args.name}'
 
     os.environ['SANDBOX_ROOT'] = self.expand(SANDBOX_ROOT)
+    os.environ['SBX_LIB']      = SBX_LIB
+    os.environ['SBX_APPS']     = self.expand_path(SANDBOX_APPS)
 
     getattr(self, self.args.cmd.replace('-', '_'))()
 
@@ -1174,7 +1226,8 @@ create_parser.add_argument(
   'rules to the new sandbox rather than import them')
 create_parser.add_argument(
   '--template', '-t', help = 'create the sandbox from a template in ' +
-  f'{SANDBOX_TEMPLATES}; mutually exclusive with --config')
+  f'{SANDBOX_TEMPLATES} or {SBX_LIB}/templates; mutually exclusive with ' +
+  '--config')
 create_parser.add_argument(
   '--rule', '-r', action = 'append', help = 'rule or rules to apply ' +
   'instead of the default rules')
@@ -1214,6 +1267,14 @@ tpl_parser.add_argument('template_name', help = 'name of the new template')
 tpl_parser.add_argument(
   '--force', '-f', action = 'store_true',
   help = 'overwrite the template if it already exists')
+
+upd_parser = subs.add_parser(
+  'update', help = 'update a sandbox with its update-hook, e.g. its program')
+upd_parser.add_argument('name', help = 'name of the sandbox')
+
+ren_parser = subs.add_parser('rename', help = 'rename an existing sandbox')
+ren_parser.add_argument('name', help = 'current name of the sandbox')
+ren_parser.add_argument('new_name', help = 'new name of the sandbox')
 
 ent_parser = subs.add_parser('enter', help = 'enter a running sandbox')
 ent_parser.add_argument('target', help = 'name of the sandbox, or a PID ' +

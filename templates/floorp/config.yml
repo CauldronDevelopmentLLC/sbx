@@ -1,0 +1,13 @@
+# Floorp.  Sandboxes made from this template share one read-only install,
+# installed on the first run and updated with "sbx update".
+use: [browser, firefox, private-home, app]
+command: [/opt/floorp/floorp]
+imports: [$SBX_LIB/global.yml]
+pre-hook: >-
+  [ -e "$SBX_APPS/floorp/current" ] ||
+  "$SBX_LIB/templates/floorp/install"
+update-hook: '"$SBX_LIB/templates/floorp/install"'
+rules:
+  app:
+    - The shared Floorp install, read-only.
+    - bind: {path: $SBX_APPS/floorp/current, dst: /opt/floorp}

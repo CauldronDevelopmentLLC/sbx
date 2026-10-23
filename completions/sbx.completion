@@ -1,17 +1,21 @@
 _sbx_completions() {
-  local cur prev CMDS SBCMDS TPLDIR
+  local cur prev CMDS SBCMDS LIB
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  CMDS="create reconfig run list list-rules delete show edit enter template help"
-  SBCMDS="reconfig run delete show edit template"
-  TPLDIR="${XDG_DATA_HOME:-$HOME/.local/share}/sbx-templates"
+  CMDS="create run update rename list ps enter list-rules delete show edit"
+  CMDS+=" template help"
+  SBCMDS="run update rename enter delete show edit template"
+  LIB="$(dirname "$(readlink -f "$(command -v sbx)")")/../lib/sbx"
 
   case "$prev" in
     -t|--template)
-      local tpls=""
-      [ -d "$TPLDIR" ] && tpls="$(ls "$TPLDIR" 2>/dev/null)"
-      COMPREPLY=( $(compgen -W "$tpls" -- ${cur}) )
+      local dir tpls=""
+      for dir in "${XDG_DATA_HOME:-$HOME/.local/share}/sbx-templates" \
+                 "$LIB/templates"; do
+        [ -d "$dir" ] && tpls+=" $(cd "$dir" && ls -d */ 2>/dev/null)"
+      done
+      COMPREPLY=( $(compgen -W "${tpls//\//}" -- ${cur}) )
       return
       ;;
     -c|--config)

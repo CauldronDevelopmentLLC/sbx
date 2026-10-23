@@ -1,0 +1,37 @@
+#!/bin/bash
+# Installs or updates Brave Origin nightly in $SBX_APPS/brave
+app=brave
+. "$SBX_LIB/templates/app.sh"
+
+prefix=brave-origin-nightly-
+suffix=-linux-$(arch amd64 arm64).zip
+url=$(curl -fsS --proto =https \
+  'https://api.github.com/repos/brave/brave-browser/releases?per_page=50' |
+  python3 -c '
+import json, sys
+for release in json.load(sys.stdin):
+  for asset in release["assets"]:
+    name = asset["name"]
+    if name.startswith(sys.argv[1]) and name.endswith(sys.argv[2]):
+      sys.exit(print(asset["browser_download_url"]))
+sys.exit("No Brave Origin nightly release found")' "$prefix" "$suffix")
+
+zip=${url##*/}
+version=${zip#"$prefix"}
+version=${version%"$suffix"}
+check "$version"
+
+fetch "$url"
+fetch "$url.sha256"
+fetch "$url.sha256.asc"
+
+log "Verifying"
+# Brave's key for GitHub pre-release checksums, from brave.com/signing-keys
+gpg --homedir "$tmp" -q --dearmor < "${0%/*}/checksums-key.asc" > "$tmp/key.gpg"
+gpgv --homedir "$tmp" -q --keyring "$tmp/key.gpg" "$tmp/$zip.sha256.asc" \
+  "$tmp/$zip.sha256"
+(cd "$tmp" && sha256sum -c --quiet "$zip.sha256")
+
+log "Unpacking"
+unzip -q "$tmp/$zip" -d "$tmp/unpacked"
+activate "$version" "$(root "$tmp/unpacked")"

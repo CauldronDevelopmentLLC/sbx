@@ -130,12 +130,15 @@ rules:
     - bind: {path: /dev/snd, dev: true, try: true}
 
   video:
-    - Enables access to video devices.
-    - bind: {path: /dev/v4l, dev: true}
+    - Enables access to video devices, e.g. cameras.
+    - bind: {path: /dev/v4l, dev: true, try: true}
     - bind: {path: /dev/video0, dev: true, try: true}
     - bind: {path: /dev/video1, dev: true, try: true}
     - bind: {path: /dev/video2, dev: true, try: true}
     - bind: {path: /dev/video3, dev: true, try: true}
+    # Device enumeration, e.g. by Chromium
+    - bind: {path: /run/udev, try: true}
+    - bind: {path: /sys/class, try: true}
 
   accessibility:
     - >-
@@ -187,6 +190,19 @@ rules:
       Allow creating user namespaces.  Needed by programs that run their own
       sandbox, such as Chromium and Electron apps, or nested containers.
     - allow-syscalls: [userns]
+
+  browser:
+    - >-
+      A web browser with GPU, audio including the microphone, cameras,
+      ~/Downloads and its own sandbox.
+    - use: [gui, gpu, audio, video, downloads, userns]
+
+  vscode:
+    - >-
+      Visual Studio Code.  Add "cwd" for the current directory.  The sandbox
+      outlives the "code" command, which returns once the window opens.
+    - use: [gui, gpu, userns]
+    - die-with-parent: false
 
   firefox:
     - A special rule for running the Firefox web browser.
