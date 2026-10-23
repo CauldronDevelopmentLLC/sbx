@@ -1,0 +1,1175 @@
+#!/usr/bin/env python3
+'''
+X11 proxy for an sbx sandbox.
+
+Sandboxed clients connect here rather than to the X server.  Their requests
+are forwarded with the host's credentials, so they get a fully featured
+connection, e.g. GLX, DRI3, MIT-SHM and RENDER, but requests which would let
+them observe or inject other clients' input, or read other clients' windows,
+are dropped or answered with an error.
+
+A resource is the sandbox's own if its ID is in the range the server gave one
+of the sandbox's clients at connection setup.  Anything else, e.g. the root
+window or another application's window, is foreign.
+
+Denied requests are replaced, keeping sequence numbers in step, by
+NoOperation or, if the client expects a reply, by GetInputFocus whose reply is
+then replaced by a fake reply or an error.  Extensions not in ALLOWED are
+hidden.  Opcodes are learned at startup, so clients cannot guess around them.
+
+Selections, e.g. the clipboard, owned outside the sandbox are readable only
+briefly after the user pastes into the sandbox or drags onto it, and only by
+the selection's owner at the first read.  Key events are dropped unless a
+sandbox window has the input focus, so an active grab cannot capture keys
+typed elsewhere.  Other clients' window properties are readable only if
+public, e.g. WM_STATE but not titles.  A trusted connection answers the
+queries these checks need.
+
+One event loop relays all connections.  Messages are parsed by header only and
+unchanged data is passed on without copying.  Tests: tests/sbx-x11.
+'''
+
+import os
+import time
+import struct
+import socket
+import argparse
+import selectors
+from array import array
+from collections import deque
+from selectors import EVENT_READ, EVENT_WRITE
+
+
+# Extensions sandboxed clients may use, others are hidden and blocked
+ALLOWED = {
+  'BIG-REQUESTS', 'Composite', 'DAMAGE', 'DOUBLE-BUFFER', 'DPMS', 'DRI3',
+  'Generic Event Extension', 'GLX', 'MIT-SCREEN-SAVER', 'MIT-SHM', 'NV-GLX',
+  'Present', 'RANDR', 'RENDER', 'SHAPE', 'SYNC', 'XC-MISC', 'XFIXES',
+  'XFree86-VidModeExtension', 'XINERAMA', 'XInputExtension', 'XKEYBOARD',
+  'XVideo'}
+
+# Core opcodes
+CREATE_WINDOW, CHANGE_WINDOW_ATTRIBUTES, REPARENT_WINDOW = 1, 2, 7
+INTERN_ATOM, GET_ATOM_NAME, CHANGE_PROPERTY, DELETE_PROPERTY = 16, 17, 18, 19
+GET_PROPERTY, SET_SELECTION_OWNER, GET_SELECTION_OWNER = 20, 22, 23
+CONVERT_SELECTION, SEND_EVENT, GRAB_POINTER, GRAB_KEYBOARD = 24, 25, 26, 31
+GRAB_KEY, GRAB_SERVER, WARP_POINTER, SET_INPUT_FOCUS = 33, 36, 41, 42
+GET_INPUT_FOCUS, QUERY_KEYMAP = 43, 44
+CREATE_GC, CHANGE_GC, COPY_AREA, COPY_PLANE, GET_IMAGE = 55, 56, 62, 63, 73
+CREATE_CURSOR, QUERY_EXTENSION, LIST_EXTENSIONS, NO_OPERATION = 93, 98, 99, 127
+GET_KEYBOARD_MAPPING, KILL_CLIENT = 101, 113
+# On the window at offset 4, e.g. DestroyWindow, MapWindow, ConfigureWindow,
+# GrabButton, ClearArea, RotateProperties
+WINDOW_WRITES = (4, 5, 6, 8, 9, 10, 11, 12, 13, 28, 61, 114)
+DRAWS = (64, 65, 66, 67, 68, 69, 70, 71, 72, 74, 75, 76, 77) # E.g. PutImage
+# Server wide, e.g. SetFontPath, ChangeKeyboardMapping, ChangeHosts
+GLOBAL_WRITES = (51, 100, 102, 105, 107, 109, 111, 116, 118)
+
+# Events
+KEY_PRESS, KEY_RELEASE, BUTTON_PRESS, BUTTON_RELEASE = 2, 3, 4, 5
+KEYMAP_NOTIFY, UNMAP_NOTIFY, SELECTION_REQUEST = 11, 18, 30
+SELECTION_NOTIFY, CLIENT_MESSAGE, MAPPING_NOTIFY, GENERIC_EVENT = 31, 33, 34, 35
+SYNTHETIC = 0x80 # Sent with SendEvent
+XI_KEY_PRESS, XI_KEY_RELEASE, XI_BUTTON_PRESS, XI_BUTTON_RELEASE = 2, 3, 4, 5
+
+# Errors
+BAD_REQUEST, BAD_MATCH, BAD_ACCESS, BAD_LENGTH = 1, 8, 10, 16
+
+RECV_SIZE       = 1 << 20
+READS           = 16 # Per readiness event
+FD_SPACE        = socket.CMSG_SPACE(255 * array('i').itemsize)
+ALREADY_GRABBED = 1
+POINTER_ROOT    = 1 # Input focus follows the pointer
+PRIMARY, WINDOW = 1, 33 # Predefined atoms
+SHIFT, CONTROL  = 1, 4
+XK_v, XK_V, XK_INSERT, XK_KP_INSERT = 0x76, 0x56, 0xff63, 0xff9e
+PASTE_TIME      = 2   # Seconds a selection is readable after a paste action
+INPUT_TIME      = 2   # Seconds the sandbox counts as in use after user input
+SELECTION_TIME  = 10  # Seconds to answer a selection request, per write
+QUERY_TIMEOUT   = 0.1 # Seconds, the server may be grabbed by a waiting client
+USER_SELECTIONS = ('PRIMARY', 'SECONDARY', 'CLIPBOARD', 'XdndSelection')
+# Selections which make the owner the window manager, tray etc.
+MANAGER_SELECTIONS = ('WM_S', '_NET_WM_CM_S', '_NET_SYSTEM_TRAY_S',
+                      '_XSETTINGS_S', '_NET_DESKTOP_MANAGER_S',
+                      'CLIPBOARD_MANAGER')
+DND_SOURCE = ('XdndEnter', 'XdndPosition', 'XdndLeave', 'XdndDrop')
+REDIRECT_MASK = 1 << 18 | 1 << 20 # ResizeRedirect, SubstructureRedirect
+# Readable on other clients' windows, e.g. to find drop targets
+PUBLIC_PROPERTIES = {
+  'WM_STATE', 'WM_TRANSIENT_FOR', '_NET_WM_STATE', '_NET_WM_WINDOW_TYPE',
+  '_NET_WM_DESKTOP', '_NET_FRAME_EXTENTS', '_MOTIF_WM_HINTS',
+  '_NET_SUPPORTING_WM_CHECK'}
+PUBLIC_PREFIXES = ('Xdnd', '_XEMBED', '_XSETTINGS')
+KEY_EVENT_MASK  = 1 << 0 | 1 << 1 | 1 << 14 # KeyPress, KeyRelease, KeymapState
+XI2_KEY_EVENTS  = (2, 3, 13, 14) # KeyPress, KeyRelease, RawKeyPress, RawKeyRel.
+XI1_KEY_EVENTS  = {1, 2, 10, 13} # DeviceKeyPress, Release, State, KeyState
+XKB_KEY_EVENTS  = {2: 28, 9: 9, 10: 9} # State, ActionMessage, AccessX: keycode
+
+
+def forbidden(*minors): return dict.fromkeys(minors, 'forbid')
+
+
+# Extension requests to filter, by minor opcode.  A check with a length needs
+# only that much of the request, the rest is streamed if it passes.
+EXT_FILTERS = {
+  'Composite': {1: 'window_4', 2: 'window_4', 3: 'window_4', 4: 'window_4',
+                6: 'window_4', 7: 'deny'}, # 7: GetOverlayWindow
+  'DAMAGE': {1: 'drawable_8', 4: 'window_4'},
+  'DOUBLE-BUFFER': {1: 'window_4'},
+  'DPMS': forbidden(3, 4, 5, 6), # E.g. SetTimeouts, ForceLevel
+  'DRI3': {3: 'read_4', 8: 'read_4'}, # BufferFromPixmap, BuffersFromPixmap
+  'GLX': {5: 'read_4', 26: 'glx_make_context_current', 13: 'drawable_12',
+          22: 'drawable_12', 31: 'drawable_12'},
+  'MIT-SCREEN-SAVER': forbidden(3, 4), # SetAttributes, UnsetAttributes
+  'MIT-SHM': {4: 'read_4'}, # GetImage
+  'Present': {1: 'drawables_4_8', 2: 'window_4', 3: 'drawable_8',
+              5: 'drawables_4_8'},
+  'RANDR': forbidden(2, 7, 12, 13, 14, 16, 17, 18, 19, 21, 24, 26, 29, 30, 34,
+                     35, 38, 39, 40, 43, 44, 45, 46), # Screen config, leases
+  'RENDER': {4: 'render_create_picture', 5: 'render_change_picture',
+             8: 'render_source', 10: 'render_source', 11: 'render_source',
+             12: 'render_source', 13: 'render_source', 23: 'render_source',
+             24: 'render_source', 25: 'render_source', 27: 'render_source'},
+  'SHAPE': {1: 'drawable_8', 2: 'drawables_8_12', 3: 'drawables_8_12',
+            4: 'drawable_8'},
+  # Read only, e.g. the refresh rate for glXGetMscRateOML
+  'XFree86-VidModeExtension': forbidden(2, 3, 5, 7, 8, 10, 12, 15, 18),
+  'XFIXES': {1: 'drawable_8', 21: 'window_4', 26: 'drawable_8',
+             27: 'forbid', 29: 'hide_cursor', 31: 'drawable_8'},
+  'XInputExtension': {
+    6: 'xi1_select', 13: 'xi1_grab', 15: 'window_4', 17: 'window_4',
+    21: 'set_input_focus', 30: 'deny', 31: 'xi1_send', 41: 'warp_pointer',
+    44: 'window_4', 46: 'xi2_select', 49: 'set_input_focus', 51: 'xi2_grab',
+    54: 'xi2_passive_grab',
+    # Device settings, mappings and properties, master devices
+    **forbidden(5, 11, 12, 23, 25, 27, 29, 33, 35, 37, 38, 43, 57, 58)},
+  'XKEYBOARD': {23: 'xkb_get_kbd_by_name', # Set keymap, controls, names etc.
+                **forbidden(5, 7, 9, 11, 14, 16, 18, 20, 25, 101)},
+  'XVideo': {5: 'drawable_8', 6: 'drawable_8', 18: ('drawable_8', 12),
+             19: 'drawable_8', **forbidden(7, 8)}, # GetVideo, GetStill
+}
+
+
+class ProtocolError(Exception): pass
+
+
+def log(msg): print(msg, flush = True)
+def pad(data): return data + b'\0' * (-len(data) % 4)
+
+
+def host_auth(num):
+  '''The host's MIT-MAGIC-COOKIE-1 for the display, if any.'''
+  path = os.environ.get('XAUTHORITY') or os.path.expanduser('~/.Xauthority')
+  try:
+    with open(path, 'rb') as f: data = f.read()
+  except OSError: return b'', b''
+
+  host, i = socket.gethostname().encode(), 0
+  while i + 2 <= len(data):
+    family, fields = int.from_bytes(data[i:i + 2]), []
+    i += 2
+    for _ in range(4):
+      n = int.from_bytes(data[i:i + 2])
+      fields.append(data[i + 2:i + 2 + n])
+      i += 2 + n
+
+    addr, number, name, cookie = fields
+    if (number == str(num).encode() and name == b'MIT-MAGIC-COOKIE-1' and
+        (family == 0xffff or (family == 256 and addr == host))):
+      return name, cookie
+
+  return b'', b''
+
+
+def connect(num):
+  sock = socket.socket(socket.AF_UNIX)
+  sock.connect(f'/tmp/.X11-unix/X{num}')
+  return sock
+
+
+def setup_request(auth, order = b'l', major = 11, minor = 0):
+  name, data = auth
+  return struct.pack(('<' if order == b'l' else '>') + 'cxHHHH2x', order,
+                     major, minor, len(name), len(data)) + pad(name) + pad(data)
+
+
+def close_fds(fds):
+  for fd in fds: os.close(fd)
+
+
+class Server:
+  '''A trusted connection.  Learns extension opcodes and event numbers once
+  and answers the checks' queries.'''
+
+  def __init__(self, num, auth):
+    self.sock, self.buf, self.seq, self.stale = connect(num), b'', 0, False
+    self.sock.sendall(setup_request(auth))
+    self.fill(8)
+    setup = self.take(8 + struct.unpack_from('<H', self.buf, 6)[0] * 4)
+    if setup[0] != 1:
+      raise ProtocolError(f'X server refused connection: {setup[8:].decode()}')
+
+    # Root windows, after the vendor string and pixmap formats
+    vendor = struct.unpack_from('<H', setup, 24)[0]
+    at, self.roots = 40 + (vendor + 3) // 4 * 4 + 8 * setup[29], set()
+    for _ in range(setup[28]):
+      self.roots.add(struct.unpack_from('<I', setup, at)[0])
+      depths, at = setup[at + 39], at + 40
+      for _ in range(depths): at += 8 + 24 * struct.unpack_from('<H', setup,
+                                                                at + 2)[0]
+    self.keycodes = setup[34], setup[35]
+
+    data, names, i = self.query(struct.pack('<BxH', LIST_EXTENSIONS, 1)), [], 32
+    for _ in range(data[1]):
+      names.append(data[i + 1:i + 1 + data[i]].decode())
+      i += 1 + data[i]
+
+    self.ops, self.events = {}, {}
+    for name in names:
+      n = len(name)
+      data = self.query(struct.pack('<BxHH2x', QUERY_EXTENSION,
+                                    2 + (n + 3) // 4, n) + pad(name.encode()))
+      if data[8]:
+        self.ops[data[9]] = name
+        self.events[name] = data[10]
+
+    self.clipboard     = self.intern('CLIPBOARD')
+    self.dnd_selection = self.intern('XdndSelection')
+    self.dnd_messages  = {self.intern(name) for name in
+                          ('XdndEnter', 'XdndPosition', 'XdndDrop')}
+    self.paste_buttons = {1: (self.clipboard,), 2: (PRIMARY,),
+                          3: (self.clipboard,)} # Button: selections
+    self.wm_check_atom = self.intern('_NET_SUPPORTING_WM_CHECK')
+    self.wm_protocols  = self.intern('WM_PROTOCOLS')
+    self.take_focus    = self.intern('WM_TAKE_FOCUS')
+    self.names         = {} # Atom: name
+    self.load_keymap()
+    self.sock.settimeout(QUERY_TIMEOUT)
+
+
+  def fill(self, n):
+    while len(self.buf) < n:
+      data = self.sock.recv(65536)
+      if not data: raise ProtocolError('X server closed the connection')
+      self.buf += data
+
+
+  def take(self, n):
+    self.fill(n)
+    data, self.buf = self.buf[:n], self.buf[n:]
+    return data
+
+
+  def message(self):
+    self.fill(32)
+    size = 32
+    if self.buf[0] == 1 or self.buf[0] & 0x7f == GENERIC_EVENT:
+      size += struct.unpack_from('<I', self.buf, 4)[0] * 4
+    return self.take(size)
+
+
+  def query(self, req):
+    '''The reply to a request, or None on an error or a timeout.'''
+    self.seq = (self.seq + 1) & 0xffff
+    try:
+      self.sock.sendall(req)
+      while True:
+        msg = self.message()
+        if msg[0] == MAPPING_NOTIFY and msg[4] == 1: self.stale = True # Keys
+        elif msg[0] < 2 and struct.unpack_from('<H', msg, 2)[0] == self.seq:
+          break
+    except TimeoutError: return None # Unread replies are skipped later
+    return msg if msg[0] else None
+
+
+  def value(self, req):
+    '''The first value of the reply, or None.'''
+    reply = self.query(req)
+    return struct.unpack_from('<I', reply, 8)[0] if reply else None
+
+
+  def focus(self): return self.value(struct.pack('<BxH', GET_INPUT_FOCUS, 1))
+
+
+  def owner(self, selection):
+    return self.value(struct.pack('<BxHI', GET_SELECTION_OWNER, 2, selection))
+
+
+  def intern(self, name):
+    return self.value(struct.pack('<BxHH2x', INTERN_ATOM, 2 + (len(name) + 3) //
+                                  4, len(name)) + pad(name.encode()))
+
+
+  def name(self, atom):
+    '''An atom's name, or None.'''
+    if atom not in self.names:
+      reply = self.query(struct.pack('<BxHI', GET_ATOM_NAME, 2, atom))
+      if not reply: return None
+      self.names[atom] = reply[32:32 + struct.unpack_from('<H', reply, 8)[0]] \
+        .decode(errors = 'replace')
+    return self.names[atom]
+
+
+  def public(self, window, atom):
+    '''Whether the property may be read on another client's window.'''
+    name = self.name(atom)
+    if name == '_NET_WM_NAME': return self.wm_check(window) # The WM's name
+    return name is not None and (name in PUBLIC_PROPERTIES or
+                                 name.startswith(PUBLIC_PREFIXES))
+
+
+  def wm_check(self, window):
+    '''Whether the window is the window manager's EWMH check window.'''
+    for root in self.roots:
+      reply = self.query(struct.pack('<BxHIIIII', GET_PROPERTY, 6, root,
+                                     self.wm_check_atom, WINDOW, 0, 1))
+      if reply and reply[1] == 32 and struct.unpack_from('<I', reply, 16)[0] \
+         and struct.unpack_from('<I', reply, 32)[0] == window: return True
+    return False
+
+
+  def pasted(self, keycode, mods):
+    '''Selections a key press pastes.'''
+    if self.stale: self.load_keymap()
+    need, selections = self.paste_keys.get(keycode, (0, ()))
+    return selections if mods & need else ()
+
+
+  def load_keymap(self):
+    '''Paste keys, keycode: (modifiers, selections).'''
+    self.stale, self.paste_keys = False, {}
+    first, count = self.keycodes[0], self.keycodes[1] - self.keycodes[0] + 1
+    reply = self.query(struct.pack('<BxHBB2x', GET_KEYBOARD_MAPPING, 2, first,
+                                   count))
+    if not reply: return
+
+    per  = reply[1]
+    syms = struct.unpack_from(f'<{count * per}I', reply, 32)
+    for i in range(count):
+      row = syms[i * per:(i + 1) * per]
+      if XK_v in row or XK_V in row:
+        self.paste_keys[first + i] = (CONTROL, (self.clipboard,))
+      elif XK_INSERT in row or XK_KP_INSERT in row:
+        self.paste_keys[first + i] = (SHIFT, (self.clipboard, PRIMARY))
+
+
+class Client:
+  '''A sandboxed client's connection, relayed to the X server.'''
+
+  def __init__(self, proxy, csock):
+    self.proxy   = proxy
+    self.server  = proxy.server
+    self.verbose = proxy.verbose
+    self.csock   = csock
+    self.ssock   = None
+    self.running = False
+    self.closed  = False
+    self.seq     = 0
+    self.pending = deque() # (seq, kind, data) awaiting the server's response
+    self.c_rem   = 0       # Bytes left to stream of the current message
+    self.s_rem   = 0
+    self.left    = {}      # Per source socket: unprocessed input
+    self.held    = {}      # Per source socket: file descriptors to pass on
+    self.queue   = {}      # Per destination socket: output not yet taken
+    self.events  = {}      # Per socket: registered selector events
+    self.add(csock)
+
+
+  def u16(self, data, at): return struct.unpack_from(self.o + 'H', data, at)[0]
+  def u32(self, data, at): return struct.unpack_from(self.o + 'I', data, at)[0]
+  def own(self, id): # Any of the sandbox's clients, e.g. a GPU process
+    return id == 0 or id & ~self.mask == self.base or self.proxy.sandbox(id)
+  def peer(self, sock): return self.ssock if sock is self.csock else self.csock
+
+
+  def add(self, sock):
+    sock.setblocking(False)
+    self.left[sock], self.held[sock], self.queue[sock] = b'', [], deque()
+    self.events[sock] = 0
+    self.update()
+
+
+  def update(self):
+    '''Wait to write a backlog, and to read unless the peer has a backlog.'''
+    for sock, old in self.events.items():
+      peer = self.peer(sock)
+      new = (0 if peer and self.queue[peer] else EVENT_READ) | \
+        (EVENT_WRITE if self.queue[sock] else 0)
+      if new == old: continue
+
+      if not old: self.proxy.sel.register(sock, new, self.ready)
+      elif not new: self.proxy.sel.unregister(sock)
+      else: self.proxy.sel.modify(sock, new, self.ready)
+      self.events[sock] = new
+
+
+  def ready(self, sock, mask):
+    if self.closed: return
+    try:
+      if mask & EVENT_WRITE: self.flush(sock)
+      if mask & EVENT_READ and not self.closed: self.read(sock)
+
+    except (OSError, ProtocolError) as e:
+      if self.verbose: log(f'Client: {e}')
+      self.close()
+
+
+  def close(self):
+    if self.closed: return
+    self.closed = True
+    self.proxy.clients.discard(self)
+
+    for sock, events in self.events.items():
+      if events: self.proxy.sel.unregister(sock)
+      sock.close()
+
+    for fds in self.held.values(): close_fds(fds)
+    for queue in self.queue.values():
+      for _, fds in queue: close_fds(fds)
+
+
+  def read(self, sock):
+    peer = self.peer(sock)
+
+    # Drain the socket, but stop at a backlog and give other sockets a turn
+    for _ in range(READS):
+      if self.closed or (peer and self.queue[peer]): return
+
+      try: n, anc, _, _ = sock.recvmsg_into([self.proxy.buf], FD_SPACE)
+      except BlockingIOError: return
+      if not n: return self.close()
+
+      for level, kind, fds in anc:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+          self.held[sock] += array('i', fds[:len(fds) - len(fds) % 4])
+
+      data = self.proxy.buf[:n]
+      self.relay(sock, self.left[sock] + data if self.left[sock] else data)
+      peer = self.peer(sock) # Set by setup
+
+
+  def relay(self, sock, data):
+    if not self.running: return self.setup(sock, bytes(data))
+
+    process = self.from_client if sock is self.csock else self.from_server
+    out, used = process(data)
+    self.left[sock] = bytes(data[used:])
+    if out:
+      self.send(self.peer(sock), out[0] if len(out) == 1 else b''.join(out),
+                sock)
+
+
+  def send(self, dst, data, src):
+    # Unchanged data is sent without copying.  File descriptors go with the
+    # bytes they arrived with, or later ones.
+    fds, self.held[src] = self.held[src], []
+    queue = self.queue[dst]
+
+    if not queue:
+      try:
+        sent = socket.send_fds(dst, [data], fds) if fds else dst.send(data)
+        close_fds(fds)
+        fds, data = [], data[sent:]
+      except BlockingIOError: pass
+      if not data: return
+
+    # Queue without copying, reading into a new buffer if data refers to it
+    if isinstance(data, memoryview): self.proxy.buf = memoryview(
+        bytearray(RECV_SIZE))
+    queue.append((data, fds))
+    self.update()
+
+
+  def flush(self, sock):
+    queue = self.queue[sock]
+
+    while queue:
+      data, fds = queue[0]
+      try: sent = socket.send_fds(sock, [data], fds) if fds else sock.send(data)
+      except BlockingIOError: break
+      close_fds(fds)
+
+      if sent < len(data):
+        queue[0] = (data[sent:], [])
+        break
+      queue.popleft()
+
+    self.update()
+
+
+  def setup(self, sock, data):
+    if sock is self.csock and not self.ssock:
+      if len(data) < 12:
+        self.left[sock] = data
+        return
+
+      order = data[:1]
+      if order not in (b'l', b'B'): raise ProtocolError('Bad byte order')
+      self.o = '<' if order == b'l' else '>'
+      major, minor, n, d = struct.unpack_from(self.o + 'HHHH', data, 2)
+      size = 12 + (n + 3) // 4 * 4 + (d + 3) // 4 * 4
+      if len(data) < size:
+        self.left[sock] = data
+        return
+
+      # The client's authorization is replaced with the host's
+      self.left[sock] = data[size:] # Relayed once running
+      self.ssock = connect(self.proxy.num)
+      self.add(self.ssock)
+      self.send(self.ssock, setup_request(self.proxy.auth, order, major,
+                                          minor), sock)
+
+    elif sock is self.ssock:
+      size = 8 + self.u16(data, 6) * 4 if 8 <= len(data) else 8
+      if len(data) < size:
+        self.left[sock] = data
+        return
+
+      reply, self.left[sock] = data[:size], data[size:]
+      self.send(self.csock, reply, sock)
+      if reply[0] != 1: raise ProtocolError('Setup failed')
+
+      self.base, self.mask = self.u32(reply, 12), self.u32(reply, 16)
+      self.build_checks()
+      self.running = True
+      self.proxy.clients.add(self)
+
+      for src in (self.csock, self.ssock):
+        data, self.left[src] = self.left[src], b''
+        if data: self.relay(src, data)
+
+    else: self.left[sock] = data # Before the server's setup reply
+
+
+  def build_checks(self):
+    '''Per opcode: None, a check or, for extensions, a list by minor opcode.
+    Per event code: None or a check.'''
+    def get(check): # A method, or (length, method) to check only the header
+      return (check[1], getattr(self, check[0])) if isinstance(check, tuple) \
+        else getattr(self, check)
+
+    self.checks = [None] * 256
+    for op, check in CORE_CHECKS.items(): self.checks[op] = get(check)
+
+    for op in range(128, 256):
+      name = self.server.ops.get(op)
+      if name not in ALLOWED: self.checks[op] = self.deny
+      elif name in EXT_FILTERS:
+        self.checks[op] = [None] * 256
+        for minor, check in EXT_FILTERS[name].items():
+          self.checks[op][minor] = get(check)
+
+    events = self.event_checks = [None] * 256
+    for code in (KEY_PRESS, KEY_RELEASE, KEYMAP_NOTIFY):
+      events[code] = self.key_event
+    events[BUTTON_PRESS] = self.button_event
+    events[BUTTON_RELEASE] = self.button_release
+    events[SELECTION_REQUEST] = self.selection_request
+    events[CLIENT_MESSAGE | SYNTHETIC] = self.client_message
+    events[GENERIC_EVENT] = self.generic_event
+
+    self.xi_op = next((op for op, name in self.server.ops.items()
+                       if name == 'XInputExtension'), None)
+    if 'XInputExtension' in self.server.events:
+      for code in XI1_KEY_EVENTS:
+        events[self.server.events['XInputExtension'] + code] = self.key_event
+    if 'XKEYBOARD' in self.server.events:
+      code = self.server.events['XKEYBOARD']
+      events[code] = events[code | SYNTHETIC] = self.xkb_event
+
+
+  def from_client(self, data):
+    '''Returns the output, as a list of pieces, and the bytes used.'''
+    out, start, i, n, o = [], 0, 0, len(data), self.o
+
+    while True:
+      if self.c_rem:
+        step = min(self.c_rem, n - i)
+        i += step
+        self.c_rem -= step
+        if self.c_rem: break
+
+      if n - i < 4: break
+      op, minor, length = struct.unpack_from(o + 'BBH', data, i)
+      big = length == 0 # BIG-REQUESTS
+      if big:
+        if n - i < 8: break
+        length = struct.unpack_from(o + 'I', data, i + 4)[0]
+      size = length * 4
+      if size < (8 if big else 4): raise ProtocolError('Bad request length')
+
+      check = self.checks[op]
+      if check.__class__ is list: check = check[minor]
+      if check.__class__ is tuple: # Passed or not by the header, e.g. PutImage
+        n_head, check = check
+        if n - i < n_head + 4 * big: break
+        if check(bytes(data[i:i + 4]) + bytes(
+            data[i + 4 + 4 * big:i + n_head + 4 * big])) is None: check = None
+      if check is None:
+        self.seq = (self.seq + 1) & 0xffff
+        self.c_rem = size
+        continue
+
+      if n - i < size: break
+      if start < i: out.append(data[start:i])
+      req = bytes(data[i:i + size])
+      i = start = i + size
+      self.seq = (self.seq + 1) & 0xffff
+
+      # Normalize, so offsets are as checks expect
+      if big:
+        if length - 1 > 0xffff:
+          out.append(self.replace(('error', BAD_LENGTH), op, minor))
+          continue
+        req = req[:2] + struct.pack(o + 'H', length - 1) + req[8:]
+
+      result = check(req)
+      if result is None: out.append(req)
+      elif isinstance(result, bytes): out.append(result)
+      else: out.append(self.replace(result, op, minor))
+
+    if start < i: out.append(data[start:i])
+    return out, i
+
+
+  def replace(self, result, op, minor):
+    if self.verbose: log(f'Denied request {op}.{minor}: {result[0]}')
+
+    if result[0] == 'drop':
+      return struct.pack(self.o + 'BxH', NO_OPERATION, 1)
+
+    data = result[1] if result[0] == 'reply' else (result[1], op, minor)
+    self.pending.append((self.seq, result[0], data))
+    return struct.pack(self.o + 'BxH', GET_INPUT_FOCUS, 1)
+
+
+  def from_server(self, data):
+    '''Returns the output, as a list of pieces, and the bytes used.'''
+    out, start, i, n, o = [], 0, 0, len(data), self.o
+
+    while True:
+      if self.s_rem:
+        step = min(self.s_rem, n - i)
+        i += step
+        self.s_rem -= step
+        if self.s_rem: break
+
+      if n - i < 32: break
+      code = data[i]
+      size = 32
+      if code == 1 or code & 0x7f == 35:
+        size += struct.unpack_from(o + 'I', data, i + 4)[0] * 4
+
+      action = check = None
+      if code < 2:
+        if self.pending and \
+           self.pending[0][0] == struct.unpack_from(o + 'H', data, i + 2)[0]:
+          action = self.pending[0]
+      else: check = self.event_checks[code]
+
+      if not (action or check):
+        self.s_rem = size
+        continue
+
+      if n - i < size: break
+      if action:
+        self.pending.popleft()
+        msg = self.respond(action, bytearray(data[i:i + size]))
+      else:
+        msg = check(data[i:i + size]) # None to pass, b'' to drop
+        if msg is None:
+          i += size
+          continue
+
+      if start < i: out.append(data[start:i])
+      i = start = i + size
+      if msg: out.append(msg)
+
+    if start < i: out.append(data[start:i])
+    return out, i
+
+
+  def respond(self, action, msg):
+    seq, kind, data = action
+
+    if kind == 'reply': return data(seq)
+
+    if kind == 'error':
+      code, op, minor = data
+      return struct.pack(self.o + 'BBHIHB21x', 0, code, seq, 0, minor, op)
+
+    if msg[0] != 1: return msg
+
+    if kind == 'query' and data not in ALLOWED: msg[8:12] = bytes(4)
+
+    if kind == 'list':
+      names, i = [], 32
+      for _ in range(msg[1]):
+        name = bytes(msg[i + 1:i + 1 + msg[i]])
+        if name.decode() in ALLOWED: names.append(name)
+        i += 1 + msg[i]
+      body = pad(b''.join(bytes([len(n)]) + n for n in names))
+      msg = struct.pack(self.o + 'BBHI24x', 1, len(names), seq,
+                        len(body) // 4) + body
+
+    return bytes(msg)
+
+
+  # Checks, return None to pass the request, new request bytes, or a
+  # replacement: ('drop',), ('reply', builder) or ('error', code)
+  def deny(self, req): return ('error', BAD_REQUEST if req[0] >= 128 else
+                               BAD_ACCESS)
+  def forbid(self, req): return ('error', BAD_ACCESS) # Server wide changes
+  def drop(self, req): return ('drop',)
+  def drop_if(self, foreign): return ('drop',) if foreign else None
+  def error_if(self, foreign): return ('error', BAD_MATCH) if foreign else None
+  def own_at(self, req, *at): return all(self.own(self.u32(req, a)) for a in at)
+
+
+  def window_4(self, req):   return self.drop_if(not self.own_at(req, 4))
+  def drawable_8(self, req): return self.drop_if(not self.own_at(req, 8))
+  def drawable_12(self, req): return self.drop_if(not self.own_at(req, 12))
+  def drawables_4_8(self, req): return self.drop_if(not self.own_at(req, 4, 8))
+  def drawables_8_12(self, req):
+    return self.drop_if(not self.own_at(req, 8, 12))
+  def read_4(self, req): return self.error_if(not self.own_at(req, 4))
+  def own_or_root(self, id): return self.own(id) or id in self.server.roots
+
+
+  def edit_values(self, req, at, edit):
+    '''Edit a value list, at the mask's offset, which ends the request.'''
+    mask = self.u32(req, at)
+    bits = [b for b in range(32) if mask & 1 << b]
+    old  = list(zip(bits, struct.unpack_from(self.o + f'{len(bits)}I', req,
+                                              at + 4)))
+    new  = [(b, edit(b, v)) for b, v in old]
+    new  = [(b, v) for b, v in new if v is not None]
+    if new == old: return None
+
+    body = req[:at] + struct.pack(self.o + f'I{len(new)}I',
+                                  sum(1 << b for b, _ in new),
+                                  *(v for _, v in new))
+    return body[:2] + struct.pack(self.o + 'H', len(body) // 4) + body[4:]
+
+
+  def window_values(self, window):
+    def edit(bit, value):
+      if not self.own(window): # Only selecting events, e.g. on the root window
+        return value & ~(KEY_EVENT_MASK | REDIRECT_MASK) if bit == 11 else None
+      if bit == 0 and value > 1 and not self.own(value): return # Background
+      if bit == 2 and not self.own(value): return # Border pixmap
+      return value
+    return edit
+
+
+  def create_window(self, req):
+    # A child of another application's window could capture or cover it
+    if not self.own_or_root(self.u32(req, 8)): return ('error', BAD_MATCH)
+    return self.edit_values(req, 28, self.window_values(self.u32(req, 4)))
+
+
+  def reparent_window(self, req):
+    return self.drop_if(not (self.own_at(req, 4) and
+                             self.own_or_root(self.u32(req, 8))))
+
+
+  def change_property(self, req): # Also DeleteProperty
+    window, prop = struct.unpack_from(self.o + 'II', req, 4)
+    # Other applications' windows only to answer their selection requests
+    return self.drop_if(not (self.own(window) or
+                             self.proxy.writable(window, prop)))
+
+
+  def set_selection_owner(self, req):
+    owner, selection = struct.unpack_from(self.o + 'II', req, 4)
+    name = self.server.name(selection)
+    return self.drop_if(
+      name is None or not self.own(owner) or
+      name.startswith(MANAGER_SELECTIONS) or # Become the WM, tray etc.
+      (name in USER_SELECTIONS and not self.proxy.active())) # Paste jacking
+
+
+  def set_input_focus(self, req): # Also XI's SetDeviceFocus and XISetFocus
+    return self.drop_if(not (self.own_at(req, 4) and self.proxy.may_focus()))
+
+
+  def warp_pointer(self, req): return self.drop_if(not self.proxy.focused())
+  hide_cursor = warp_pointer
+
+
+  def kill_client(self, req):
+    resource = self.u32(req, 4) # 0 kills all clients' retained resources
+    return self.drop_if(not (resource and self.own(resource)))
+
+
+  def xkb_get_kbd_by_name(self, req):
+    if req[10]: return self.forbid(req) # Loads a new keymap
+
+
+  def change_window_attributes(self, req):
+    return self.edit_values(req, 8, self.window_values(self.u32(req, 4)))
+
+
+  def gc_values(self, bit, value):
+    if bit in (10, 11, 19) and not self.own(value): return # Tile, stipple, clip
+    return value
+
+
+  def create_gc(self, req): return self.edit_values(req, 12, self.gc_values)
+  def change_gc(self, req): return self.edit_values(req, 8, self.gc_values)
+
+
+  def send_event(self, req):
+    dest, code = self.u32(req, 4), req[12] & 0x7f
+    if code == CLIENT_MESSAGE: return self.drop_if(not self.may_send_message(
+      dest, *struct.unpack_from(self.o + '3I', req, 16)))
+    if code == SELECTION_NOTIFY: return # Answers a paste from the sandbox
+    if code == UNMAP_NOTIFY and dest in self.server.roots: # Withdraws a window
+      return self.drop_if(not self.own_at(req, 20))
+    return self.drop_if(dest < 2 or not self.own(dest))
+
+
+  def may_send_message(self, dest, window, kind, data):
+    '''Whether the sandbox may send a ClientMessage.'''
+    name = self.server.name(kind) or ''
+
+    # Drag messages make the dragged data readable, as do fake drops
+    if name in DND_SOURCE: return self.proxy.dragging()
+    if name.startswith(('Xdnd', '_XEMBED')) or \
+       name == '_NET_SYSTEM_TRAY_OPCODE': return True
+
+    # Requests to the window manager, e.g. _NET_WM_STATE, about own windows
+    if dest in self.server.roots: return self.own(window)
+
+    # WM_TAKE_FOCUS allows setting the focus, see Proxy.may_focus()
+    return 1 < dest and self.own(dest) and not (
+      kind == self.server.wm_protocols and data == self.server.take_focus)
+
+
+  def grab_keyboard(self, req):
+    if not (self.own(self.u32(req, 4)) and self.proxy.focused()):
+      return ('reply', lambda seq: struct.pack(
+        self.o + 'BBHI24x', 1, ALREADY_GRABBED, seq, 0))
+
+  grab_pointer = grab_keyboard
+
+
+  def query_keymap(self, req):
+    return ('reply', lambda seq: struct.pack(self.o + 'BxHI32x', 1, seq, 2))
+
+
+  def get_property(self, req):
+    window, prop = struct.unpack_from(self.o + 'II', req, 4)
+    if self.proxy.sandbox(window): return
+    if window in self.server.roots or self.server.public(window, prop):
+      if req[1]: return req[:1] + b'\0' + req[2:] # Without deleting it
+      return
+
+    # As if the property did not exist
+    if self.verbose: log(f'Hid property {self.server.name(prop)} on {window:x}')
+    return ('reply', lambda seq: struct.pack(self.o + 'BBHIIII12x', 1, 0, seq,
+                                             0, 0, 0, 0))
+
+
+  def convert_selection(self, req):
+    requestor, selection, target, _, stamp = struct.unpack_from(self.o + '5I',
+                                                                 req, 4)
+    if not self.own(requestor): return ('drop',)
+    if self.proxy.readable(selection): return
+    if self.verbose: log(f'Refused reading selection {selection}')
+
+    # Refuse as an owner would, with SelectionNotify without a property
+    event = struct.pack(self.o + 'B3x5I8x', SELECTION_NOTIFY, stamp, requestor,
+                        selection, target, 0)
+    return struct.pack(self.o + 'BxHII', SEND_EVENT, 11, requestor, 0) + event
+
+
+  def create_cursor(self, req):
+    return self.drop_if(not (self.own(self.u32(req, 8)) and
+                             self.own(self.u32(req, 12))))
+
+
+  def query_extension(self, req):
+    n = self.u16(req, 4)
+    self.pending.append((self.seq, 'query', req[8:8 + n].decode(
+      errors = 'replace')))
+
+
+  def list_extensions(self, req): self.pending.append((self.seq, 'list', None))
+
+
+  def glx_make_context_current(self, req):
+    return self.error_if(not (self.own(self.u32(req, 8)) and
+                              self.own(self.u32(req, 12))))
+
+
+  def picture_values(self, bit, value):
+    if bit in (1, 6) and not self.own(value): return # Alpha map, clip mask
+    return value
+
+
+  def render_create_picture(self, req):
+    if not self.own(self.u32(req, 8)): return ('drop',)
+    return self.edit_values(req, 16, self.picture_values)
+
+
+  def render_change_picture(self, req):
+    return self.edit_values(req, 8, self.picture_values)
+
+
+  def render_source(self, req):
+    mask = self.u32(req, 12) if req[1] == 8 else 0 # Composite's mask
+    return self.drop_if(not (self.own(self.u32(req, 8)) and self.own(mask)))
+
+
+  def xi1_select(self, req):
+    if self.own(self.u32(req, 4)): return
+    first   = self.server.events['XInputExtension']
+    classes = struct.unpack_from(self.o + f'{self.u16(req, 8)}I', req, 12)
+    classes = [c for c in classes if (c & 0xff) - first not in XI1_KEY_EVENTS]
+    body = req[:8] + struct.pack(self.o + f'H2x{len(classes)}I', len(classes),
+                                 *classes)
+    return body[:2] + struct.pack(self.o + 'H', len(body) // 4) + body[4:]
+
+
+  def grab_status_reply(self, req):
+    if not (self.own(self.u32(req, 4)) and self.proxy.focused()):
+      return ('reply', lambda seq: struct.pack(
+        self.o + 'BxHIB23x', 1, seq, 0, ALREADY_GRABBED))
+
+  xi1_grab = xi2_grab = grab_status_reply
+
+
+  def xi1_send(self, req):
+    dest = self.u32(req, 4)
+    return self.drop_if(dest < 2 or not self.own(dest))
+
+
+  def xi2_select(self, req):
+    if self.own(self.u32(req, 4)): return
+    req, at = bytearray(req), 12
+    for _ in range(self.u16(req, 8)):
+      length = self.u16(req, at + 2) * 4
+      for event in XI2_KEY_EVENTS:
+        if event // 8 < length: req[at + 4 + event // 8] &= ~(1 << event % 8)
+      at += 4 + length
+    return bytes(req)
+
+
+  def xi2_passive_grab(self, req):
+    if not self.own(self.u32(req, 8)): # Pretend all modifiers succeeded
+      return ('reply', lambda seq: struct.pack(self.o + 'BxHIH22x', 1, seq, 0,
+                                               0))
+
+
+  # Event checks, return None to pass the event, b'' to drop it or new bytes
+  def key(self, keycode, mods = None): # With modifiers for key presses
+    # Unfocused, keys come from an active grab and were typed elsewhere
+    if not self.proxy.focused(): return b''
+    if mods is not None:
+      self.proxy.input()
+      self.proxy.allow_paste(*self.server.pasted(keycode, mods))
+
+
+  def key_event(self, msg): # Core and XI1 key events, KeymapNotify
+    return self.key(msg[1], self.u16(msg, 28) if msg[0] == KEY_PRESS else None)
+
+
+  def button_event(self, msg): self.click(msg[1], self.u32(msg, 12))
+  def button_release(self, msg): self.proxy.release()
+
+
+  def click(self, button, window):
+    if not (self.proxy.sandbox(window) and self.proxy.focused()): return
+    self.proxy.input(drag = True)
+    self.proxy.allow_paste(*self.server.paste_buttons.get(button, ()))
+
+
+  def generic_event(self, msg):
+    if msg[1] != self.xi_op: return
+    kind = self.u16(msg, 8)
+    if kind == XI_BUTTON_PRESS: self.click(self.u32(msg, 16), self.u32(msg, 24))
+    elif kind == XI_BUTTON_RELEASE: self.proxy.release()
+    elif kind in (XI_KEY_PRESS, XI_KEY_RELEASE):
+      return self.key(self.u32(msg, 16),
+                      self.u32(msg, 72) if kind == XI_KEY_PRESS else None)
+
+
+  def client_message(self, msg): # From another client, see send_event()
+    window, kind, data = struct.unpack_from(self.o + '3I', msg, 4)
+    if not self.proxy.sandbox(window): return
+    if kind in self.server.dnd_messages:
+      self.proxy.allow_paste(self.server.dnd_selection)
+    elif kind == self.server.wm_protocols and data == self.server.take_focus:
+      self.proxy.focus_until = time.monotonic() + INPUT_TIME
+
+
+  def selection_request(self, msg): # Another application reads our selection
+    requestor, _, target, prop = struct.unpack_from(self.o + '4I', msg, 12)
+    self.proxy.allow_write(requestor, prop or target)
+
+
+  def xkb_event(self, msg):
+    at = XKB_KEY_EVENTS.get(msg[1])
+    if at is None: return
+    msg = bytearray(msg)
+    msg[at] = 0 # Hide the keycode
+    return msg
+
+
+CORE_CHECKS = {
+  CREATE_WINDOW: 'create_window',
+  CHANGE_WINDOW_ATTRIBUTES: 'change_window_attributes',
+  REPARENT_WINDOW: 'reparent_window',
+  CHANGE_PROPERTY: 'change_property',
+  DELETE_PROPERTY: 'change_property',
+  SET_SELECTION_OWNER: 'set_selection_owner',
+  SEND_EVENT: 'send_event',
+  GRAB_POINTER: 'grab_pointer',
+  GRAB_KEYBOARD: 'grab_keyboard',
+  GRAB_KEY: 'window_4',
+  GRAB_SERVER: 'drop',
+  WARP_POINTER: 'warp_pointer',
+  SET_INPUT_FOCUS: 'set_input_focus',
+  QUERY_KEYMAP: 'query_keymap',
+  GET_PROPERTY: 'get_property',
+  CONVERT_SELECTION: 'convert_selection',
+  CREATE_GC: 'create_gc',
+  CHANGE_GC: 'change_gc',
+  COPY_AREA: ('drawables_4_8', 12),
+  COPY_PLANE: ('drawables_4_8', 12),
+  GET_IMAGE: 'read_4',
+  CREATE_CURSOR: 'create_cursor',
+  QUERY_EXTENSION: 'query_extension',
+  LIST_EXTENSIONS: 'list_extensions',
+  KILL_CLIENT: 'kill_client',
+  **dict.fromkeys(WINDOW_WRITES, 'window_4'),
+  **dict.fromkeys(DRAWS, ('window_4', 8)), # On the drawable at offset 4
+  **dict.fromkeys(GLOBAL_WRITES, 'forbid'),
+}
+
+
+class Proxy:
+  '''Relays all clients' connections in one event loop.'''
+
+  def __init__(self, num, listen, verbose):
+    self.num     = num
+    self.listen  = listen
+    self.verbose = verbose
+    self.auth    = host_auth(num)
+    self.server  = Server(num, self.auth)
+    self.buf     = memoryview(bytearray(RECV_SIZE)) # Shared, see Client.send()
+    self.sel     = selectors.DefaultSelector()
+    self.clients = set()
+    self.paste   = {} # Selection: (readable until, owner at the first read)
+    self.writes  = {} # (window, property): writable until, see allow_write()
+    self.input_until = self.focus_until = self.drag_until = 0
+
+    if os.path.exists(listen): os.unlink(listen)
+    self.listener = socket.socket(socket.AF_UNIX)
+    self.listener.bind(listen)
+    self.listener.listen(64)
+    self.listener.setblocking(False)
+    self.sel.register(self.listener, EVENT_READ, self.accept)
+
+
+  def sandbox(self, id):
+    '''Whether a resource belongs to any of the sandbox's clients.'''
+    return 1 < id and any(id & ~c.mask == c.base for c in self.clients)
+
+
+  def focused(self):
+    '''Whether a sandbox window has the input focus.'''
+    focus = self.server.focus()
+    # With POINTER_ROOT keys go to the window under the pointer, unchecked
+    return focus == POINTER_ROOT or (focus is not None and self.sandbox(focus))
+
+
+  def input(self, drag = False): # In a focused sandbox window
+    self.input_until = time.monotonic() + INPUT_TIME
+    if drag: self.drag_until = float('inf')
+
+
+  def release(self): # Drops follow the button release
+    self.drag_until = min(self.drag_until, time.monotonic() + INPUT_TIME)
+
+
+  def active(self):   return time.monotonic() < self.input_until
+  def dragging(self): return time.monotonic() < self.drag_until
+
+
+  def may_focus(self):
+    '''Whether the sandbox may set the input focus, as after a click or when
+    the window manager offers it with WM_TAKE_FOCUS.'''
+    return self.active() or time.monotonic() < self.focus_until or \
+      self.focused()
+
+
+  def allow_write(self, window, prop):
+    '''Allow answering a selection request, by writing the property.'''
+    now = time.monotonic()
+    self.writes = {k: t for k, t in self.writes.items() if now < t}
+    self.writes[window, prop] = now + SELECTION_TIME
+
+
+  def writable(self, window, prop):
+    now = time.monotonic()
+    if self.writes.get((window, prop), 0) <= now: return False
+    self.writes[window, prop] = now + SELECTION_TIME # INCR writes repeatedly
+    return True
+
+
+  def allow_paste(self, *selections):
+    until = time.monotonic() + PASTE_TIME
+    for selection in selections: self.paste[selection] = (until, None)
+
+
+  def readable(self, selection):
+    '''Whether sandbox clients may read the selection now.'''
+    owner = self.server.owner(selection)
+    if owner is None: return False
+    if self.sandbox(owner): return True
+
+    until, first = self.paste.get(selection, (0, None))
+    if time.monotonic() >= until or first not in (None, owner): return False
+    self.paste[selection] = (until, owner) # Later reads must match
+    return True
+
+
+  def accept(self, sock, mask):
+    try: Client(self, sock.accept()[0])
+    except BlockingIOError: pass
+
+
+  def exit(self, fd, mask): # The sandbox has exited
+    try: os.unlink(self.listen)
+    except OSError: pass
+    os._exit(0)
+
+
+  def run(self, exit_fd):
+    self.sel.register(exit_fd, EVENT_READ, self.exit)
+    while True:
+      for key, mask in self.sel.select(): key.data(key.fileobj, mask)
+
+
+def main():
+  parser = argparse.ArgumentParser(description = 'X11 proxy for a sandbox.')
+  parser.add_argument('display', help = 'X display to connect to, e.g. :0')
+  parser.add_argument('listen', help = 'socket path to listen on')
+  parser.add_argument('--ready-fd', type = int, required = True,
+                      help = 'write "x" to this fd once ready')
+  parser.add_argument('--exit-fd', type = int, required = True,
+                      help = 'exit when this fd reaches EOF')
+  parser.add_argument('--verbose', action = 'store_true')
+  args = parser.parse_args()
+
+  proxy = Proxy(int(args.display.split(':')[1].split('.')[0]), args.listen,
+                args.verbose)
+  os.write(args.ready_fd, b'x')
+  os.close(args.ready_fd)
+  log(f'X11 proxy for {args.display} on {args.listen}')
+  proxy.run(args.exit_fd)
+
+
+if __name__ == '__main__': main()

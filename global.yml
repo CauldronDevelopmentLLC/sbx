@@ -14,7 +14,6 @@ rules:
     - proc: /proc
     - dev: /dev
     - tmpfs: /tmp
-    - restrict-tty:
     - env: {PATH: /usr/bin:/bin}
     - env: [LANG, XDG_RUNTIME_DIR, XDG_SESSION_TYPE, TERM, HOME, LOGNAME, USER,
             EDITOR, SANDBOX]
@@ -30,9 +29,21 @@ rules:
     - symlink: [usr/bin, /bin]
     - symlink: [usr/bin, /sbin]
     - tmpfs: {path: $XDG_RUNTIME_DIR, perms: 0o700}
-    - file: $XDG_RUNTIME_DIR/flatpak-info
-    - file: /.flatpak-info
     - bind: {path: /run/systemd/resolve, try: true}
+
+  host-net:
+    - >-
+      Share the host's network, including local networks, services listening
+      on the host and the host's abstract Unix sockets, e.g. X11's.
+    - net: host
+
+  no-net:
+    - Loopback only, no network access.
+    - net: none
+
+  cups:
+    - Allow access to the host's CUPS printing service on localhost:631.
+    - host-port: 631
 
   downloads:
     - Bind the user's Downloads directory.
@@ -74,7 +85,7 @@ rules:
 
   gui:
     - Enables typical Graphical User Interface options.
-    - use: [common, x11, wayland, audio, dbus, accessibility]
+    - use: [common, x11, wayland, dbus]
 
   shell:
     - Options for a temporary shell with typical CLI and GUI options.
@@ -85,15 +96,24 @@ rules:
     - bind: {cwd: true, read-write: true}
 
   x11:
-    - Allow access to an X11 display.
-    - ifdef:
-      - DISPLAY
-      - env: DISPLAY
-      - bind: /tmp/.X11-unix/
-    - ifdef:
-      - XAUTHORITY
-      - env: XAUTHORITY
-      - bind: $XAUTHORITY
+    - >-
+      Allow filtered access to an X11 display, via sbx-x11.  Cannot read or
+      inject other applications' input or read their windows.  Has hardware
+      accelerated graphics.
+    - ifdef: [DISPLAY, {x11: filtered}]
+
+  x11-untrusted:
+    - >-
+      Allow untrusted access to an X11 display, enforced by the X server.  No
+      hardware accelerated graphics, themed cursors or copy to the host.
+    - ifdef: [DISPLAY, {x11: untrusted}]
+
+  x11-trusted:
+    - >-
+      Allow trusted access to an X11 display.  Enables hardware accelerated
+      graphics but allows reading and injecting input to all applications on
+      the display, including keystrokes typed in terminals outside the sandbox.
+    - ifdef: [DISPLAY, {x11: trusted}]
 
   wayland:
     - Allow access to Wayland.
@@ -103,7 +123,7 @@ rules:
       - bind: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY
 
   audio:
-    - Enables pulseaudio or pipewire.
+    - Enables pulseaudio or pipewire, including microphone access.
     - bind: $XDG_RUNTIME_DIR/pulse/native
     - bind: {path: $HOME/.config/pulse/cookie, try: true}
     - bind: {path: $XDG_RUNTIME_DIR/pipewire-0, try: true}
@@ -118,32 +138,24 @@ rules:
     - bind: {path: /dev/video3, dev: true, try: true}
 
   accessibility:
-    - Enables dbus accessibility calls.
-    - dbus: {allow: call, path: 'org.a11y.Bus.*=*'}
+    - >-
+      Enables dbus accessibility calls.  Allows reading text from and
+      triggering actions in other applications which support accessibility.
+    - dbus-forward: org.a11y.Bus
     - bind: {path: $XDG_RUNTIME_DIR/at-spi, try: true}
 
   dbus:
     - >-
-      Enables limited dbus access through XDG Desktop Portal.
-      It allows access to files outside the sandbox but only via the
-      systems file selection dialog.  As well as, printing and screen
-      sharing services.
-    - dbus: {allow: talk, path: org.freedesktop.portal.Documents}
-    - dbus: {allow: talk, path: org.freedesktop.portal.Flatpak}
-    - dbus: {allow: talk, path: org.freedesktop.portal.Desktop}
-    - dbus: {allow: talk, path: org.freedesktop.portal.FileChooser}
-    - dbus: {allow: talk, path: org.freedesktop.portal.Print}
-    - dbus: {allow: talk, path: org.freedesktop.portal.Camera}
-    - dbus: {allow: talk, path: org.freedesktop.portal.Device}
-    - dbus: {allow: talk, path: org.freedesktop.portal.*}
-    - dbus:
-        allow: broadcast
-        path: org.freedesktop.portal.Desktop=org.freedesktop.portal.Settings.SettingChanged@/org/freedesktop/portal/desktop
-    - bind:
-        path: $XDG_RUNTIME_DIR/doc/by-app/$APP_NAME
-        dst: $XDG_RUNTIME_DIR/doc
-        read-write: true
-        try: true
+      Gives the sandbox a private D-Bus session bus with sbx's XDG Desktop
+      Portal.  Files outside the sandbox are only accessible when chosen in
+      the system's file dialog.  Links open in host applications, files only
+      after the user chooses the application.
+    - portal: [file-chooser, open-uri, print, settings, network-monitor,
+               proxy-resolver]
+    - dbus-forward: org.freedesktop.portal.IBus
+    # Use portals, without pretending to be Flatpak
+    - env: {GTK_USE_PORTAL: 1, GDK_DEBUG: portals, GIO_USE_PORTALS: 1,
+            QT_QPA_PLATFORMTHEME: xdgdesktopportal}
 
   gpu:
     - Enables GPU access.
@@ -170,17 +182,18 @@ rules:
     - bind: {path: /sys/module/nvidia,     try: true}
     - bind: {path: /sys/module/nvidia_uvm, try: true}
 
+  userns:
+    - >-
+      Allow creating user namespaces.  Needed by programs that run their own
+      sandbox, such as Chromium and Electron apps, or nested containers.
+    - allow-syscalls: [userns]
+
   firefox:
     - A special rule for running the Firefox web browser.
     - ifdef:
       - WAYLAND_DISPLAY
       - env: {MOZ_ENABLE_WAYLAND: 1}
-    - dbus: {allow: own, path: org.mozilla.firefox.*}
-
-  gthumb:
-    - A special rule for running the GThumb image viewer.
-    - dbus: {allow: own, path: org.gnome.gThumb.*}
 
   transmission:
     - Allow access to Transmission bittorrent client
-    - dbus: {allow: call, path: com.transmissionbt.Transmission.*=*}
+    - dbus-forward: com.transmissionbt.Transmission

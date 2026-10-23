@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+'''
+A private D-Bus session bus and XDG Desktop Portal for an sbx sandbox.
+
+Sandboxes get their own bus rather than filtered access to the host's.  sbx
+implements the FileChooser and OpenURI portals itself, using the host's portal
+backend for dialogs and the host's document portal to export chosen files.
+Other portals and services are forwarded to the host by name.  Because every
+client on the private bus belongs to the sandbox, no flatpak style app
+identification is needed.
+
+One service, and bus, is shared by all runs of the same sandbox.  Each run
+holds a shared lock for its lifetime.  The service exits once it can take the
+lock exclusively.  sbx starts it, see SBX.setup_portal().
+'''
+
+import os
+import stat
+import fcntl
+import ctypes
+import signal
+import argparse
+import subprocess
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib
+
+
+DESKTOP      = 'org.freedesktop.portal.Desktop'
+DOCUMENTS    = 'org.freedesktop.portal.Documents'
+REQUEST      = 'org.freedesktop.portal.Request'
+FILE_CHOOSER = 'org.freedesktop.portal.FileChooser'
+OPEN_URI     = 'org.freedesktop.portal.OpenURI'
+PRINT        = 'org.freedesktop.portal.Print'
+PROPERTIES   = 'org.freedesktop.DBus.Properties'
+IMPL         = 'org.freedesktop.impl.portal'
+DESKTOP_PATH = '/org/freedesktop/portal/desktop'
+DOCS_PATH    = '/org/freedesktop/portal/documents'
+NO_FLAGS     = Gio.DBusCallFlags.NONE
+
+# Portals forwarded to the host's portal
+PASSTHROUGH = {
+  'settings':        'org.freedesktop.portal.Settings',
+  'network-monitor': 'org.freedesktop.portal.NetworkMonitor',
+  'proxy-resolver':  'org.freedesktop.portal.ProxyResolver',
+}
+LOCAL       = ('file-chooser', 'open-uri', 'print') # Need the backend
+PORTALS     = LOCAL + tuple(PASSTHROUGH)
+URI_SCHEMES = ('http', 'https', 'mailto')
+VERSIONS    = {FILE_CHOOSER: 3, OPEN_URI: 4, DOCUMENTS: 4, PRINT: 2}
+
+# Document portal AddFull flags
+REUSE_EXISTING   = 1
+AS_NEEDED_BY_APP = 4
+EXPORT_DIRECTORY = 8
+
+# FileChooser options passed on to the backend
+CHOOSER_OPTIONS = {
+  'accept_label': 's', 'modal': 'b', 'multiple': 'b', 'directory': 'b',
+  'filters': 'a(sa(us))', 'current_filter': '(sa(us))',
+  'choices': 'a(ssa(ss)s)', 'current_name': 's'}
+
+# Print options passed on to the backend
+PRINT_OPTIONS = {'modal': 'b', 'token': 'u', 'accept_label': 's'}
+
+# No <servicedir>, otherwise the sandbox could start host services
+BUS_CONFIG = '''\
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path=%s</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+'''
+
+INTROSPECTION = Gio.DBusNodeInfo.new_for_xml('''
+<node>
+  <interface name="org.freedesktop.portal.FileChooser">
+    <method name="OpenFile">
+      <arg type="s" direction="in"/><arg type="s" direction="in"/>
+      <arg type="a{sv}" direction="in"/><arg type="o" direction="out"/>
+    </method>
+    <method name="SaveFile">
+      <arg type="s" direction="in"/><arg type="s" direction="in"/>
+      <arg type="a{sv}" direction="in"/><arg type="o" direction="out"/>
+    </method>
+    <method name="SaveFiles">
+      <arg type="s" direction="in"/><arg type="s" direction="in"/>
+      <arg type="a{sv}" direction="in"/><arg type="o" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.OpenURI">
+    <method name="OpenURI">
+      <arg type="s" direction="in"/><arg type="s" direction="in"/>
+      <arg type="a{sv}" direction="in"/><arg type="o" direction="out"/>
+    </method>
+    <method name="OpenFile">
+      <arg type="s" direction="in"/><arg type="h" direction="in"/>
+      <arg type="a{sv}" direction="in"/><arg type="o" direction="out"/>
+    </method>
+    <method name="OpenDirectory">
+      <arg type="s" direction="in"/><arg type="h" direction="in"/>
+      <arg type="a{sv}" direction="in"/><arg type="o" direction="out"/>
+    </method>
+    <method name="SchemeSupported">
+      <arg type="s" direction="in"/><arg type="a{sv}" direction="in"/>
+      <arg type="b" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.Print">
+    <method name="PreparePrint">
+      <arg type="s" direction="in"/><arg type="s" direction="in"/>
+      <arg type="a{sv}" direction="in"/><arg type="a{sv}" direction="in"/>
+      <arg type="a{sv}" direction="in"/><arg type="o" direction="out"/>
+    </method>
+    <method name="Print">
+      <arg type="s" direction="in"/><arg type="s" direction="in"/>
+      <arg type="h" direction="in"/><arg type="a{sv}" direction="in"/>
+      <arg type="o" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.Request">
+    <method name="Close"/>
+  </interface>
+  <interface name="org.freedesktop.portal.Documents">
+    <method name="GetMountPoint"><arg type="ay" direction="out"/></method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+</node>''')
+
+
+def iface(name): return INTROSPECTION.lookup_interface(name)
+
+
+class Request:
+  '''A portal request object, see org.freedesktop.portal.Request.'''
+
+  def __init__(self, svc, client, options):
+    token = options.lookup_value('handle_token', GLib.VariantType('s'))
+    token = token.get_string() if token else f'sbx{svc.next_id()}'
+
+    self.svc     = svc
+    self.client  = client
+    self.path    = f'{DESKTOP_PATH}/request/{client[1:].replace('.', '_')}/' \
+      + token
+    self.backend = None
+
+    if not GLib.Variant.is_object_path(self.path):
+      raise ValueError(f'Invalid handle_token "{token}"')
+
+    # Unique for the backend, which is shared by all sandboxes
+    self.handle = f'{DESKTOP_PATH}/request/sbx{os.getpid()}/{svc.next_id()}'
+
+    self.id = svc.private.register_object(
+      self.path, iface(REQUEST), self.close)
+
+
+  def close(self, conn, sender, path, iface, method, params, inv):
+    if self.backend:
+      self.svc.host.call(self.backend, self.handle, f'{IMPL}.Request', 'Close',
+                         None, None, NO_FLAGS, -1, None, None, None)
+    self.unregister()
+    inv.return_value(None)
+
+
+  def unregister(self):
+    if self.id: self.svc.private.unregister_object(self.id)
+    self.id = None
+
+
+  def respond(self, code, results = {}):
+    if not self.id: return # Closed
+    if isinstance(results, dict): results = GLib.Variant('a{sv}', results)
+    self.svc.private.emit_signal(
+      self.client, self.path, REQUEST, 'Response',
+      GLib.Variant.new_tuple(GLib.Variant('u', code), results))
+    self.unregister()
+
+
+  def call_backend(self, iface, method, args, cb, fds = None):
+    def done(host, res, _):
+      try:
+        ret = host.call_with_unix_fd_list_finish(res)[0]
+        cb(ret.get_child_value(0).get_uint32(), ret.get_child_value(1))
+      except (GLib.Error, OSError) as e:
+        self.svc.log(f'{iface}.{method}: {e}')
+        self.respond(2)
+
+    self.backend = self.svc.backend
+    self.svc.host.call_with_unix_fd_list(
+      self.backend, DESKTOP_PATH, f'{IMPL}.{iface}', method, args,
+      GLib.VariantType('(ua{sv})'), NO_FLAGS, GLib.MAXINT, fds, None, done,
+      None)
+
+
+class Service:
+  def __init__(self, dir, app_id, portals, forwards, verbose):
+    self.dir      = dir
+    self.app_id   = app_id
+    self.portals  = set(portals)
+    self.verbose  = verbose
+    self.doc_dir  = os.environ['XDG_RUNTIME_DIR'] + '/doc'
+    self.clients  = {} # Private bus client -> host connection
+    self.counter  = 0
+
+    # Forwarding routes: private bus name -> (host name, interfaces or None)
+    self.routes = {name: (name, None) for name in forwards}
+    ifaces = {PASSTHROUGH[p] for p in portals if p in PASSTHROUGH}
+    if ifaces: self.routes[DESKTOP] = (DESKTOP, ifaces)
+
+
+  def log(self, msg): print(msg, flush = True)
+
+
+  def next_id(self):
+    self.counter += 1
+    return self.counter
+
+
+  def run(self, ready_fd):
+    path = f'{self.dir}/bus'
+    if os.path.exists(path): os.unlink(path) # Stale
+
+    conf = f'{self.dir}/bus.conf'
+    with open(conf, 'w') as f: f.write(BUS_CONFIG % path)
+
+    # dbus-daemon dies with the service
+    libc = ctypes.CDLL(None)
+    self.daemon = subprocess.Popen(
+      ['dbus-daemon', '--nofork', '--nopidfile', f'--config-file={conf}',
+       '--print-address=1'], stdout = subprocess.PIPE,
+      preexec_fn = lambda: libc.prctl(1, signal.SIGTERM)) # PR_SET_PDEATHSIG
+    address = self.daemon.stdout.readline().decode().strip()
+    if not address: raise RuntimeError('dbus-daemon failed to start')
+
+    self.host    = Gio.bus_get_sync(Gio.BusType.SESSION)
+    self.private = Gio.DBusConnection.new_for_address_sync(
+      address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
+      Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION)
+    self.private.add_filter(self.private_filter)
+
+    # Drop host connections when their client leaves
+    self.private.signal_subscribe(
+      'org.freedesktop.DBus', 'org.freedesktop.DBus', 'NameOwnerChanged',
+      '/org/freedesktop/DBus', None, Gio.DBusSignalFlags.NONE,
+      self.name_owner_changed)
+
+    # Relay forwarded broadcast signals
+    for host_name, ifaces in self.routes.values():
+      for i in ifaces or [None]:
+        self.host.signal_subscribe(
+          host_name, i, None, None, None, Gio.DBusSignalFlags.NONE,
+          self.relay_broadcast)
+
+    names = set(self.routes)
+    if self.portals & set(LOCAL):
+      self.backend = self.find_backend()
+      names.add(DESKTOP)
+
+    for portal, name in (('open-uri', OPEN_URI), ('print', PRINT)):
+      if portal in self.portals:
+        self.private.register_object(
+          DESKTOP_PATH, iface(name), self.method_call, self.property)
+
+    if 'file-chooser' in self.portals:
+      names.add(DOCUMENTS)
+      self.private.register_object(
+        DESKTOP_PATH, iface(FILE_CHOOSER), self.method_call, self.property)
+      self.private.register_object(
+        DOCS_PATH, iface(DOCUMENTS), self.method_call, self.property)
+      self.documents('GetMountPoint', None, None, '(ay)') # Start it
+
+    for name in names:
+      self.private.call_sync(
+        'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+        'RequestName', GLib.Variant('(su)', (name, 4)), # Do not queue
+        GLib.VariantType('(u)'), NO_FLAGS, -1, None)
+
+    # Exit when no sandbox holds the shared lock
+    lock = open(f'{self.dir}/lock', 'a')
+    loop = GLib.MainLoop()
+
+    def check_lock():
+      try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      except BlockingIOError: return True
+      loop.quit()
+      return False
+
+    GLib.timeout_add_seconds(2, check_lock)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+      GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, loop.quit)
+
+    os.write(ready_fd, b'x')
+    os.close(ready_fd)
+    self.log(f'Portal for {self.app_id} on {address}')
+
+    try: loop.run()
+    finally: # dbus-daemon removes its socket
+      self.daemon.terminate()
+      self.daemon.wait()
+
+
+  def find_backend(self):
+    names = set()
+    for method in ('ListNames', 'ListActivatableNames'):
+      names.update(self.host.call_sync(
+        'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+        method, None, GLib.VariantType('(as)'), NO_FLAGS, -1,
+        None).unpack()[0])
+
+    desktops = os.environ.get('XDG_CURRENT_DESKTOP', '').lower().split(':')
+    for desktop in desktops + ['gtk', 'gnome', 'kde', 'xapp', 'lxqt']:
+      name = f'{IMPL}.desktop.{desktop}'
+      if name in names: return name
+
+    raise RuntimeError('No portal backend found')
+
+
+  def documents(self, method, args, fd, reply):
+    fds = Gio.UnixFDList.new_from_array([fd]) if fd is not None else None
+    return self.host.call_with_unix_fd_list_sync(
+      DOCUMENTS, DOCS_PATH, DOCUMENTS, method, args, GLib.VariantType(reply),
+      NO_FLAGS, -1, fds, None)[0]
+
+
+  def property(self, conn, sender, path, iface, name):
+    return GLib.Variant('u', VERSIONS[iface])
+
+
+  def method_call(self, conn, sender, path, iface, method, params, inv):
+    if iface == DOCUMENTS: # GetMountPoint
+      return inv.return_value(GLib.Variant.new_tuple(
+        GLib.Variant.new_bytestring(self.doc_dir.encode())))
+
+    if method == 'SchemeSupported':
+      scheme = params.get_child_value(0).get_string().lower()
+      return inv.return_value(GLib.Variant('(b)', (
+        scheme in URI_SCHEMES and
+        Gio.AppInfo.get_default_for_uri_scheme(scheme) is not None,)))
+
+    if self.verbose: self.log(f'{sender} {iface}.{method}')
+    msg = inv.get_message()
+
+    # Options are always the last argument
+    options = params.get_child_value(params.n_children() - 1)
+    try: req = Request(self, sender, options)
+    except (GLib.Error, ValueError) as e:
+      return inv.return_dbus_error(
+        'org.freedesktop.portal.Error.InvalidArgument', str(e))
+
+    inv.return_value(GLib.Variant('(o)', (req.path,)))
+
+    try:
+      if iface == FILE_CHOOSER: self.file_chooser(req, method, params)
+      elif iface == PRINT: self.print(req, method, params, msg)
+      else: self.open_uri(req, method, params, msg)
+
+    except (GLib.Error, OSError) as e:
+      self.log(f'{iface}.{method}: {e}')
+      req.respond(2)
+
+
+  def file_chooser(self, req, method, params):
+    parent, title, options = [params.get_child_value(i) for i in range(3)]
+    opts = filter_options(options, CHOOSER_OPTIONS)
+
+    # Sandbox paths mean nothing to the backend, pass only file names
+    file = options.lookup_value('current_file', GLib.VariantType('ay'))
+    if file and 'current_name' not in opts:
+      opts['current_name'] = GLib.Variant(
+        's', os.path.basename(file.get_bytestring().decode(errors = 'replace')))
+
+    files = options.lookup_value('files', GLib.VariantType('aay'))
+    if files:
+      opts['files'] = GLib.Variant('aay', [
+        os.path.basename(f).encode() + b'\0'
+        for f in files.get_bytestring_array()])
+
+    save      = method != 'OpenFile'
+    directory = 'directory' in opts and opts['directory'].get_boolean()
+
+    def done(code, results):
+      out = {}
+      for key in ('choices', 'current_filter'):
+        value = results.lookup_value(key, None)
+        if value is not None: out[key] = value
+
+      if code == 0:
+        uris     = results.lookup_value('uris', GLib.VariantType('as'))
+        writable = results.lookup_value('writable', GLib.VariantType('b'))
+        writable = save or (writable is not None and writable.get_boolean())
+        out['uris'] = GLib.Variant('as', [
+          self.export(uri, save, directory, writable)
+          for uri in (uris.unpack() if uris else [])])
+
+      req.respond(code, out)
+
+    req.call_backend('FileChooser', method, GLib.Variant(
+      '(osssa{sv})', (req.handle, self.app_id, parent.get_string(),
+                      title.get_string(), opts)), done)
+
+
+  def export(self, uri, save, directory, writable):
+    '''Grant the sandbox access to a host file via the document portal.'''
+    path = Gio.File.new_for_uri(uri).get_path()
+    if not path: raise OSError(f'Not a local file "{uri}"')
+
+    name  = os.path.basename(path)
+    flags = REUSE_EXISTING | AS_NEEDED_BY_APP
+    perms = GLib.Variant('as', ['read', 'write'] if writable else ['read'])
+    app   = GLib.Variant('s', self.app_id)
+
+    if save: # May not exist yet
+      fd  = os.open(os.path.dirname(path), os.O_PATH | os.O_CLOEXEC)
+      ret = self.documents('AddNamedFull', GLib.Variant.new_tuple(
+        GLib.Variant('h', 0), GLib.Variant.new_bytestring(name.encode()),
+        GLib.Variant('u', flags), app, perms), fd, '(sa{sv})')
+      doc_id = ret.get_child_value(0).get_string()
+
+    else:
+      if directory: flags |= EXPORT_DIRECTORY
+      fd  = os.open(path, os.O_PATH | os.O_CLOEXEC)
+      ret = self.documents('AddFull', GLib.Variant.new_tuple(
+        GLib.Variant('ah', [0]), GLib.Variant('u', flags), app, perms), fd,
+        '(asa{sv})')
+      doc_id = ret.get_child_value(0).get_child_value(0).get_string()
+
+    return Gio.File.new_for_path(f'{self.doc_dir}/{doc_id}/{name}').get_uri()
+
+
+  def print(self, req, method, params, msg):
+    args = [GLib.Variant('o', req.handle), GLib.Variant('s', self.app_id),
+            params.get_child_value(0), params.get_child_value(1)]
+    opts = filter_options(params.get_child_value(params.n_children() - 1),
+                          PRINT_OPTIONS)
+    fds  = None
+
+    if method == 'PreparePrint': # Settings and page setup are opaque
+      args += [params.get_child_value(2), params.get_child_value(3)]
+
+    else:
+      fd = msg.get_unix_fd_list().get(params.get_child_value(2).get_handle())
+      if not stat.S_ISREG(os.fstat(fd).st_mode): # Not e.g. a pipe or device
+        os.close(fd)
+        raise OSError('Print document is not a regular file')
+      fds = Gio.UnixFDList.new_from_array([fd])
+      args.append(GLib.Variant('h', 0))
+
+    args.append(GLib.Variant('a{sv}', opts))
+    req.call_backend('Print', method, GLib.Variant.new_tuple(*args),
+                     req.respond, fds)
+
+
+  def open_uri(self, req, method, params, msg):
+    if method == 'OpenURI':
+      uri = params.get_child_value(1).get_string()
+      if (GLib.Uri.peek_scheme(uri) or '') not in URI_SCHEMES:
+        raise OSError(f'URI scheme not allowed "{uri}"')
+      Gio.AppInfo.launch_default_for_uri(uri, None)
+      return req.respond(0)
+
+    idx  = params.get_child_value(1).get_handle()
+    path = verified_path(msg.get_unix_fd_list().get(idx))
+
+    if method == 'OpenDirectory':
+      if not os.path.isdir(path): path = os.path.dirname(path)
+      type = 'inode/directory'
+
+    else:
+      if not os.path.isfile(path): raise OSError(f'Not a file "{path}"')
+      type = Gio.File.new_for_path(path).query_info(
+        'standard::content-type', Gio.FileQueryInfoFlags.NONE,
+        None).get_content_type()
+      if type == 'application/x-desktop' or (
+          Gio.content_type_can_be_executable(type) and
+          os.stat(path).st_mode & 0o111):
+        raise OSError(f'Refusing to open executable "{path}"')
+
+    choices = [a.get_id().removesuffix('.desktop')
+               for a in Gio.AppInfo.get_all_for_type(type)]
+    if not choices: raise OSError(f'No application for "{type}"')
+
+    # Always ask, the sandbox chose the content
+    def done(code, results):
+      choice = results.lookup_value('choice', GLib.VariantType('s'))
+      choice = choice.get_string() if choice else None
+      app    = choice and Gio.DesktopAppInfo.new(choice + '.desktop')
+      if code != 0 or not app or choice not in choices:
+        return req.respond(code or 2)
+      app.launch([Gio.File.new_for_path(path)], None)
+      req.respond(0)
+
+    opts = {'content_type': GLib.Variant('s', type),
+            'filename': GLib.Variant('s', os.path.basename(path)),
+            'modal': GLib.Variant('b', True)}
+    req.call_backend('AppChooser', 'ChooseApplication', GLib.Variant(
+      '(ossasa{sv})', (req.handle, self.app_id,
+                       params.get_child_value(0).get_string(), choices, opts)),
+      done)
+
+
+  def route(self, msg):
+    '''Return the host name a private bus method call is forwarded to.'''
+    if msg.get_message_type() != Gio.DBusMessageType.METHOD_CALL: return
+    route = self.routes.get(msg.get_destination())
+    if not route: return
+
+    host_name, ifaces = route
+    if ifaces is None: return host_name
+
+    iface = msg.get_interface()
+    if iface == PROPERTIES:
+      body  = msg.get_body()
+      iface = body.get_child_value(0).get_string() if body else None
+
+    if iface in ifaces: return host_name
+
+
+  def private_filter(self, conn, msg, incoming):
+    # Runs in GDBus' worker thread
+    host_name = self.route(msg) if incoming else None
+    if not host_name: return msg
+    GLib.idle_add(self.forward_call, msg, host_name)
+
+
+  def host_conn(self, client):
+    conn = self.clients.get(client)
+    if conn: return conn
+
+    # One host connection per client, keeps unicast signals separate
+    conn = Gio.DBusConnection.new_for_address_sync(
+      Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION),
+      Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
+      Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION)
+    conn.add_filter(lambda c, msg, incoming:
+                    self.host_filter(client, msg, incoming))
+    self.clients[client] = conn
+    return conn
+
+
+  def host_filter(self, client, msg, incoming):
+    # Runs in GDBus' worker thread
+    if (incoming and msg.get_message_type() == Gio.DBusMessageType.SIGNAL
+        and msg.get_destination()
+        and msg.get_sender() != 'org.freedesktop.DBus'): # e.g. NameAcquired
+      GLib.idle_add(self.relay_unicast, client, msg)
+    return msg
+
+
+  def forward_call(self, msg, host_name):
+    client = msg.get_sender()
+    if self.verbose:
+      self.log(f'{client} -> {host_name} {msg.get_interface()}.'
+               f'{msg.get_member()}')
+
+    fwd = Gio.DBusMessage.new_method_call(
+      host_name, msg.get_path(), msg.get_interface(), msg.get_member())
+    copy_payload(msg, fwd)
+    fwd.set_flags(msg.get_flags())
+
+    try: conn = self.host_conn(client)
+    except GLib.Error as e:
+      self.reply_error(msg, 'org.freedesktop.DBus.Error.Failed', e.message)
+      return False
+
+    if msg.get_flags() & Gio.DBusMessageFlags.NO_REPLY_EXPECTED:
+      conn.send_message(fwd, Gio.DBusSendMessageFlags.NONE)
+      return False
+
+    def done(conn, res, _):
+      try: reply = conn.send_message_with_reply_finish(res)
+      except GLib.Error as e:
+        return self.reply_error(
+          msg, 'org.freedesktop.DBus.Error.Failed', e.message)
+
+      if reply.get_message_type() == Gio.DBusMessageType.ERROR:
+        body = reply.get_body()
+        text = body.get_child_value(0).get_string() if body and \
+          body.get_type_string().startswith('(s') else ''
+        return self.reply_error(msg, reply.get_error_name(), text)
+
+      out = msg.new_method_reply()
+      copy_payload(reply, out)
+      self.private.send_message(out, Gio.DBusSendMessageFlags.NONE)
+
+    conn.send_message_with_reply(
+      fwd, Gio.DBusSendMessageFlags.NONE, -1, None, done, None)
+    return False
+
+
+  def reply_error(self, msg, name, text):
+    self.private.send_message(msg.new_method_error_literal(name, text),
+                              Gio.DBusSendMessageFlags.NONE)
+
+
+  def relay_unicast(self, client, msg):
+    out = Gio.DBusMessage.new_signal(
+      msg.get_path(), msg.get_interface(), msg.get_member())
+    copy_payload(msg, out)
+    out.set_destination(client)
+    self.private.send_message(out, Gio.DBusSendMessageFlags.NONE)
+    return False
+
+
+  def relay_broadcast(self, conn, sender, path, iface, member, params):
+    self.private.emit_signal(None, path, iface, member, params)
+
+
+  def name_owner_changed(self, conn, sender, path, iface, member, params):
+    name, old, new = params.unpack()
+    if not new and name in self.clients: self.clients.pop(name).close()
+
+
+def filter_options(options, types):
+  '''Known, correctly typed portal options as a dict of variants.'''
+  opts = {}
+  for key, type in types.items():
+    value = options.lookup_value(key, GLib.VariantType(type))
+    if value is not None: opts[key] = value
+  return opts
+
+
+def copy_payload(src, dst):
+  body = src.get_body()
+  if body is not None: dst.set_body(body)
+  fds = src.get_unix_fd_list()
+  if fds is not None: dst.set_unix_fd_list(fds)
+
+
+def verified_path(fd):
+  '''Host path of a file descriptor from the sandbox.'''
+  try:
+    path = os.readlink(f'/proc/self/fd/{fd}')
+    a, b = os.fstat(fd), os.stat(path)
+  finally: os.close(fd)
+
+  # The path is resolved on the host, it must be the same file
+  if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
+    raise OSError(f'File not visible on host "{path}"')
+
+  return path
+
+
+if __name__ == '__main__':
+  parser = argparse.ArgumentParser(
+    description = 'Private D-Bus session bus and portal for an sbx sandbox.')
+  parser.add_argument('dir', help = 'directory for the bus socket and lock')
+  parser.add_argument('app_id', help = 'app ID for the document portal')
+  parser.add_argument('--ready-fd', type = int, required = True,
+                      help = 'write "x" to this fd once ready')
+  parser.add_argument('--portal', action = 'append', default = [],
+                      choices = PORTALS, help = 'enable a portal')
+  parser.add_argument('--forward', action = 'append', default = [],
+                      help = 'forward a D-Bus name to the host')
+  parser.add_argument('--verbose', action = 'store_true')
+  args = parser.parse_args()
+
+  Service(args.dir, args.app_id, args.portal, args.forward,
+          args.verbose).run(args.ready_fd)

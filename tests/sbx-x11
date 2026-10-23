@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+'''Offline tests of sbx-x11's filtering, on hand-built requests and replies.'''
+
+import os, sys, struct, importlib.machinery, importlib.util
+from collections import deque
+
+loader = importlib.machinery.SourceFileLoader('sbx_x11', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'sbx-x11'))
+spec = importlib.util.spec_from_loader('sbx_x11', loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+
+OWN, OWN2, ROOT, OTHER = 0x200001, 0x200002, 0x500, 0x400010
+CLIPBOARD, DND_SEL, DND_POS, PROTOCOLS, TAKE_FOCUS, WM_S0, XEMBED = 500, 600, 601, 700, 701, 702, 703
+NAMES = {CLIPBOARD: 'CLIPBOARD', 1: 'PRIMARY', DND_SEL: 'XdndSelection', DND_POS: 'XdndPosition', PROTOCOLS: 'WM_PROTOCOLS',
+         TAKE_FOCUS: 'WM_TAKE_FOCUS', WM_S0: 'WM_S0', XEMBED: '_XEMBED'}
+
+class Server:
+  '''The trusted connection's answers, set by the tests.'''
+  ops = {130: 'XInputExtension', 131: 'RENDER', 132: 'GLX', 133: 'XTEST', 134: 'XKEYBOARD', 135: 'MIT-SHM', 136: 'Composite',
+         137: 'XFree86-VidModeExtension', 138: 'RANDR', 139: 'XVideo'}
+  events = {'XInputExtension': 70, 'XKEYBOARD': 85}
+  roots, clipboard, dnd_selection, dnd_messages = {ROOT}, CLIPBOARD, DND_SEL, {DND_POS}
+  wm_protocols, take_focus = PROTOCOLS, TAKE_FOCUS
+  paste_buttons = {1: (CLIPBOARD,), 2: (m.PRIMARY,), 3: (CLIPBOARD,)}
+  def __init__(self): self.focus_window, self.owners = OWN, {}
+  def focus(self): return self.focus_window
+  def owner(self, selection): return self.owners.get(selection, 0)
+  def public(self, window, atom): return atom == 39 # As if public
+  def name(self, atom): return NAMES.get(atom, str(atom))
+  def pasted(self, keycode, mods): return (CLIPBOARD,) if keycode == 55 and mods & m.CONTROL else ()
+
+class Feed:
+  '''Feeds chunks like the proxy, carrying leftovers between reads.'''
+  def __init__(self, process): self.process, self.left = process, b''
+  def __call__(self, chunk):
+    buf = memoryview(bytearray(chunk))
+    data = self.left + buf if self.left else buf
+    out, used = self.process(data)
+    self.left = bytes(data[used:])
+    return b''.join(out)
+
+def client(p = None, base = 0x200000):
+  if not p:
+    p = m.Proxy.__new__(m.Proxy) # No sockets
+    p.server, p.clients, p.paste, p.writes = Server(), set(), {}, {}
+    p.input_until = p.focus_until = p.drag_until = 0
+  c = m.Client.__new__(m.Client)
+  c.proxy, c.server, c.verbose, c.seq, c.pending, c.c_rem, c.s_rem = p, p.server, False, 0, deque(), 0, 0
+  c.o, c.base, c.mask = '<', base, 0x1fffff
+  c.build_checks()
+  p.clients.add(c)
+  c.cf, c.sf = Feed(c.from_client), Feed(c.from_server)
+  return c
+
+NOOP, GIF = struct.pack('<BxH', 127, 1), struct.pack('<BxH', 43, 1)
+fails = 0
+def check(name, ok, detail = ''):
+  global fails
+  fails += not ok
+  print(f'{"PASS" if ok else "FAIL"} {name} {detail}')
+
+def req(op, minor, body):
+  body = bytes(body); body += b'\0' * (-len(body) % 4)
+  return struct.pack('<BBH', op, minor, 1 + len(body) // 4) + body
+
+def run(c, data): return c.cf(data)
+
+# Core
+c = client()
+r = req(2, 0, struct.pack('<III', ROOT, 1 << 11, 1 | 2 | 1 << 22))
+check('CWA root strips key events', run(c, r) == req(2, 0, struct.pack('<III', ROOT, 1 << 11, 1 << 22)))
+r = req(2, 0, struct.pack('<III', OWN, 1 << 11, 3)); check('CWA own unchanged', run(c, r) == r)
+r = req(2, 0, struct.pack('<IIII', OWN, 1 | 1 << 11, OTHER, 3))
+check('CWA own: foreign background pixmap removed', run(c, r) == req(2, 0, struct.pack('<III', OWN, 1 << 11, 3)))
+check('GrabKey root dropped', run(c, req(33, 0, struct.pack('<IHBBB3x', ROOT, 0, 0, 1, 1))) == NOOP)
+check('GrabKey own passed', run(c, req(33, 0, struct.pack('<IHBBB3x', OWN, 0, 0, 1, 1))) != NOOP)
+ev = struct.pack('<BB30x', 2, 38)
+check('SendEvent KeyPress to InputFocus dropped', run(c, req(25, 0, struct.pack('<II', 1, 0) + ev)) == NOOP)
+check('SendEvent SelectionNotify passed', run(c, req(25, 0, struct.pack('<II', OTHER, 0) + struct.pack('<B31x', 31))) != NOOP)
+r = req(55, 0, struct.pack('<IIII', OWN2, OWN, 1 << 10, OTHER))
+check('CreateGC foreign tile stripped', run(c, r) == req(55, 0, struct.pack('<III', OWN2, OWN, 0)))
+check('CopyArea from root dropped', run(c, req(62, 0, struct.pack('<IIIhhhhHH', ROOT, OWN, OWN2, 0, 0, 0, 0, 1, 1))) == NOOP)
+
+# Mixed chunk: passed, replaced and passed requests in one read
+c = client()
+a, b = req(43, 0, b''), req(62, 0, struct.pack('<IIIhhhhHH', OWN, OWN2, OWN, 0, 0, 0, 0, 1, 1))
+check('mixed chunk keeps order', run(c, a + req(33, 0, struct.pack('<IHBBB3x', ROOT, 0, 0, 1, 1)) + b) == a + NOOP + b)
+
+# Replies and sequence numbers
+c = client()
+run(c, req(43, 0, b''))
+check('QueryKeymap replaced by GetInputFocus', run(c, req(44, 0, b'')) == GIF)
+out = c.sf(struct.pack('<BBHI24x', 1, 0, 1, 0) + struct.pack('<BBHI24x', 1, 0, 2, 0))
+check('seq 1 reply untouched, seq 2 becomes zero keymap', len(out) == 72 and out[:4] == b'\x01\x00\x01\x00'
+      and out[32] == 1 and struct.unpack_from('<HI', out, 34) == (2, 2) and not any(out[40:]))
+
+# Requests and replies split across reads
+c = client()
+r = req(33, 0, struct.pack('<IHBBB3x', ROOT, 0, 0, 1, 1))
+check('request split across reads', run(c, r[:3]) == b'' and run(c, r[3:9]) == b'' and run(c, r[9:]) == NOOP)
+run(c, req(44, 0, b''))
+rep = struct.pack('<BBHI24x', 1, 0, 2, 0)
+check('reply split across reads', c.sf(rep[:10]) == b'' and len(c.sf(rep[10:])) == 40)
+
+# Big requests
+c = client()
+big = struct.pack('<BBHI', 33, 0, 0, 5) + struct.pack('<IHBBB3x', ROOT, 0, 0, 1, 1)
+check('big-request GrabKey on root normalized and dropped', run(c, big) == NOOP)
+put = struct.pack('<BBHII', 72, 2, 0, 1 + 1 + 100000, OWN) + b'\x07' * 399996
+r2 = req(43, 0, b'')
+out = run(c, put[:1000]) + run(c, put[1000:300000]) + run(c, put[300000:] + r2)
+check('big PutImage streamed intact, next request parsed', out == put + r2 and c.seq == 3, c.seq)
+c2 = client()
+try: run(c2, struct.pack('<BBHI', 72, 2, 0, 1)); check('zero length big request rejected', False)
+except m.ProtocolError: check('zero length big request rejected', True)
+
+# Extensions
+c = client()
+mask = bytearray(4)
+for e in (2, 3, 6, 13, 14): mask[e // 8] |= 1 << e % 8
+exp = bytearray(4); exp[0] |= 1 << 6
+check('XISelectEvents root keeps motion only', run(c, req(130, 46, struct.pack('<IH2xHH', ROOT, 1, 2, 1) + bytes(mask)))[-4:] == bytes(exp))
+classes = [(3 << 8) | (70 + 1), (3 << 8) | (70 + 15), (3 << 8) | (70 + 13)]
+r = req(130, 6, struct.pack('<IH2x3I', ROOT, 3, *classes))
+check('XI1 select on root keeps presence class', run(c, r) == req(130, 6, struct.pack('<IH2xI', ROOT, 1, classes[1])))
+out = run(c, req(130, 51, struct.pack('<IIIHBBBxH', ROOT, 0, 0, 3, 0, 0, 0, 0)))
+check('XIGrabDevice root faked', out == GIF and c.pending[-1][1] == 'reply')
+check('XI unfiltered minor passed', run(c, req(130, 47, struct.pack('<HH', 2, 2))) == req(130, 47, struct.pack('<HH', 2, 2)))
+check('RENDER CreatePicture on root dropped', run(c, req(131, 4, struct.pack('<IIII', OWN, ROOT, 1, 0))) == NOOP)
+r = req(131, 4, struct.pack('<IIIII', OWN, OWN2, 1, 1 << 6, OTHER))
+check('RENDER CreatePicture foreign clip mask stripped', run(c, r) == req(131, 4, struct.pack('<IIII', OWN, OWN2, 1, 0)))
+check('RENDER Composite foreign src dropped', run(c, req(131, 8, struct.pack('<B3xIIIhhhhhhHH', 3, OTHER, 0, OWN, 0, 0, 0, 0, 0, 0, 1, 1))) == NOOP)
+r = req(131, 8, struct.pack('<B3xIIIhhhhhhHH', 3, OWN, 0, OWN2, 0, 0, 0, 0, 0, 0, 1, 1))
+check('RENDER Composite own src passed', run(c, r) == r)
+check('MIT-SHM GetImage root denied', run(c, req(135, 4, struct.pack('<IhhHHIBxxxII', ROOT, 0, 0, 1, 1, 0, 2, 0, 0))) == GIF)
+check('Composite NameWindowPixmap foreign dropped', run(c, req(136, 6, struct.pack('<II', OTHER, OWN))) == NOOP)
+seq = c.seq + 1
+check('GLX MakeCurrent on root denied', run(c, req(132, 5, struct.pack('<III', ROOT, 0, 0))) == GIF and c.pending[-1][:2] == (seq, 'error'))
+check('hidden XTEST request denied', run(c, req(133, 2, b'\0' * 32)) == GIF and c.pending[-1][2][0] == m.BAD_REQUEST)
+check('VidMode GetModeLine passed', run(c, req(137, 1, struct.pack('<H2x', 0))) == req(137, 1, struct.pack('<H2x', 0)))
+check('VidMode SetGamma denied', run(c, req(137, 15, struct.pack('<H2xIII12x', 0, 1, 1, 1))) == GIF and c.pending[-1][1] == 'error')
+check('unknown opcode denied', run(c, req(200, 0, b'')) == GIF)
+
+# Server side rewrites
+c = client()
+run(c, req(98, 0, struct.pack('<H2x', 5) + b'XTEST'))
+run(c, req(98, 0, struct.pack('<H2x', 6) + b'RENDER'))
+run(c, req(99, 0, b''))
+names = b''.join(bytes([len(n)]) + n for n in (b'XTEST', b'RENDER', b'RECORD'))
+names += b'\0' * (-len(names) % 4)
+out = c.sf(struct.pack('<BxHIBBBB20x', 1, 1, 0, 1, 133, 0, 0) + struct.pack('<BxHIBBBB20x', 1, 2, 0, 1, 131, 0, 0) +
+           struct.pack('<BBHI24x', 1, 3, 3, len(names) // 4) + names)
+check('QueryExtension XTEST hidden', out[8:12] == bytes(4))
+check('QueryExtension RENDER kept', out[32 + 8:32 + 10] == bytes([1, 131]))
+check('ListExtensions lists RENDER only', out[65] == 1 and out[96:103] == b'\x06RENDER')
+xkb = bytearray(32); xkb[0], xkb[1], xkb[28] = 85, 2, 38
+out = c.sf(bytes(xkb))
+check('XKB StateNotify keycode hidden', out[28] == 0 and out[1] == 2)
+g = struct.pack('<BBHIH22x', 35, 131, 5, 1, 0) + b'abcd'
+check('GenericEvent passed', c.sf(g) == g)
+
+# Resources of the sandbox's other clients, e.g. a GPU process
+c = client()
+gpu = client(c.proxy, 0x600000)
+r = req(132, 31, struct.pack('<IIII', 0, 1, OWN, 0x600001))
+check('GLX CreateWindow on another sandbox client\'s window passed', gpu.cf(r) == r)
+check('GLX CreateWindow on a foreign window dropped', gpu.cf(req(132, 31, struct.pack('<IIII', 0, 1, OTHER, 0x600002))) == NOOP)
+
+# Focus, selections and properties
+def key(code, keycode, state, window = OWN): return struct.pack('<BBHIIIIhhhhHBx', code, keycode, 0, 0, ROOT, window, 0, 0, 0, 0, 0, state, 1)
+def xi2(evtype, detail, mods = 0, window = OWN):
+  return struct.pack('<BBHIHHIIIII16xHHHHI4I4x', 35, 130, 0, 12, evtype, 3, 0, detail, ROOT, window, 0, 0, 0, 3, 0, 0, 0, 0, 0, mods)
+def convert(requestor, selection, stamp = 7): return req(24, 0, struct.pack('<5I', requestor, selection, 31, 99, stamp))
+def refused(requestor, selection, stamp = 7):
+  return struct.pack('<BxHII', 25, 11, requestor, 0) + struct.pack('<B3x5I8x', 31, stamp, requestor, selection, 31, 0)
+
+c = client()
+c.server.owners = {CLIPBOARD: OTHER, m.PRIMARY: OTHER, DND_SEL: OTHER}
+check('ConvertSelection refused without paste', run(c, convert(OWN, CLIPBOARD)) == refused(OWN, CLIPBOARD))
+check('ConvertSelection for foreign requestor dropped', run(c, convert(OTHER, CLIPBOARD)) == NOOP)
+k = key(2, 55, m.CONTROL)
+check('Ctrl+V passed', c.sf(k) == k)
+check('after Ctrl+V CLIPBOARD readable', run(c, convert(OWN, CLIPBOARD)) == convert(OWN, CLIPBOARD))
+check('after Ctrl+V PRIMARY refused', run(c, convert(OWN, m.PRIMARY)) == refused(OWN, m.PRIMARY))
+c.server.owners[CLIPBOARD] = OTHER + 1
+check('new CLIPBOARD owner within window refused', run(c, convert(OWN, CLIPBOARD)) == refused(OWN, CLIPBOARD))
+c.server.owners[CLIPBOARD] = OWN2
+check('sandbox owned CLIPBOARD readable', run(c, convert(OWN, CLIPBOARD)) == convert(OWN, CLIPBOARD))
+
+c = client()
+c.server.owners = {CLIPBOARD: OTHER, m.PRIMARY: OTHER}
+c.sf(key(4, 2, 0))
+check('middle click makes PRIMARY readable', run(c, convert(OWN, m.PRIMARY)) == convert(OWN, m.PRIMARY))
+check('middle click leaves CLIPBOARD refused', run(c, convert(OWN, CLIPBOARD)) == refused(OWN, CLIPBOARD))
+c.proxy.paste[m.PRIMARY] = (0, None)
+check('expired paste refused', run(c, convert(OWN, m.PRIMARY)) == refused(OWN, m.PRIMARY))
+c.server.focus_window = OTHER
+c.sf(key(4, 1, 0))
+check('click while unfocused opens nothing', run(c, convert(OWN, CLIPBOARD)) == refused(OWN, CLIPBOARD))
+c.sf(xi2(4, 1))
+check('XI2 click while unfocused opens nothing', run(c, convert(OWN, CLIPBOARD)) == refused(OWN, CLIPBOARD))
+c.server.focus_window = OWN2
+c.sf(xi2(4, 1))
+check('XI2 left click makes CLIPBOARD readable', run(c, convert(OWN, CLIPBOARD)) == convert(OWN, CLIPBOARD))
+
+c = client()
+c.server.focus_window = OTHER
+check('KeyPress dropped while unfocused', c.sf(key(2, 38, 0)) == b'')
+check('XI2 KeyRelease dropped while unfocused', c.sf(xi2(3, 38)) == b'')
+xi1 = struct.pack('<BB30x', 70 + 1, 38)
+check('XI1 DeviceKeyPress dropped while unfocused', c.sf(xi1) == b'')
+km = struct.pack('<B31x', 11)
+check('KeymapNotify dropped while unfocused', c.sf(km) == b'')
+check('mixed events keep the rest', c.sf(km + key(6, 0, 0) + km) == key(6, 0, 0))
+check('GrabKeyboard own while unfocused faked', run(c, req(31, 0, struct.pack('<IIBB2x', OWN, 0, 1, 1))) == GIF)
+c.server.focus_window = OWN
+check('KeyPress passed while focused', c.sf(key(2, 38, 0)) == key(2, 38, 0))
+check('XI2 KeyPress passed while focused', c.sf(xi2(2, 38)) == xi2(2, 38))
+r = req(31, 0, struct.pack('<IIBB2x', OWN, 0, 1, 1))
+check('GrabKeyboard own while focused passed', run(c, r) == r)
+c.server.focus_window = m.POINTER_ROOT
+check('KeyPress passed with PointerRoot focus', c.sf(key(2, 38, 0)) == key(2, 38, 0))
+
+c = client()
+gp = lambda window, prop: req(20, 0, struct.pack('<IIIII', window, prop, 0, 0, 100))
+check('GetProperty foreign private faked', run(c, gp(OTHER, 400)) == GIF and c.pending[-1][1] == 'reply')
+for name, r in (('foreign public', gp(OTHER, 39)), ('root', gp(ROOT, 400)), ('own', gp(OWN, 400))):
+  check(f'GetProperty {name} passed', run(c, r) == r)
+
+c = client()
+c.server.owners = {DND_SEL: OTHER}
+cm = lambda window, kind: req(25, 0, struct.pack('<II', window, 0) + struct.pack('<BBHII20x', 33, 32, 0, window, kind))
+check('XdndPosition to own window dropped without a drag', run(c, cm(OWN, DND_POS)) == NOOP)
+check('XdndPosition to host window dropped without a drag', run(c, cm(OTHER, DND_POS)) == NOOP)
+check('other ClientMessage to own window passed', run(c, cm(OWN, 700)) == cm(OWN, 700))
+check('XdndSelection refused before a drag message', run(c, convert(OWN, DND_SEL)) == refused(OWN, DND_SEL))
+c.sf(struct.pack('<BBHII20x', 33 | 0x80, 32, 0, OWN, DND_POS))
+check('host XdndPosition makes XdndSelection readable', run(c, convert(OWN, DND_SEL)) == convert(OWN, DND_SEL))
+c.sf(key(4, 1, 0))
+check('XdndPosition to host window passed while a button is held', run(c, cm(OTHER, DND_POS)) == cm(OTHER, DND_POS))
+c.sf(key(5, 1, 0))
+check('XdndPosition passed just after the release, for the drop', run(c, cm(OTHER, DND_POS)) == cm(OTHER, DND_POS))
+c.proxy.drag_until = 0
+check('XdndPosition dropped after the drag', run(c, cm(OTHER, DND_POS)) == NOOP)
+
+# Writes to other applications' windows and server wide state
+c = client()
+c.server.focus_window = OTHER
+for op, name in ((4, 'DestroyWindow'), (8, 'MapWindow'), (10, 'UnmapWindow'), (13, 'CirculateWindow')):
+  check(f'{name} foreign dropped', run(c, req(op, 0, struct.pack('<I', OTHER))) == NOOP)
+  r = req(op, 0, struct.pack('<I', OWN)); check(f'{name} own passed', run(c, r) == r)
+check('ConfigureWindow foreign dropped', run(c, req(12, 0, struct.pack('<IH2x', OTHER, 0))) == NOOP)
+check('ReparentWindow foreign into own dropped', run(c, req(7, 0, struct.pack('<IIhh', OTHER, OWN, 0, 0))) == NOOP)
+check('ReparentWindow own into foreign dropped', run(c, req(7, 0, struct.pack('<IIhh', OWN, OTHER, 0, 0))) == NOOP)
+r = req(7, 0, struct.pack('<IIhh', OWN, ROOT, 0, 0)); check('ReparentWindow own to root passed', run(c, r) == r)
+cw = lambda parent: req(1, 24, struct.pack('<IIhhHHHHII', OWN2, parent, 0, 0, 1, 1, 0, 1, 0, 0))
+check('CreateWindow in a foreign window denied', run(c, cw(OTHER)) == GIF and c.pending[-1][1] == 'error')
+check('CreateWindow on root passed', run(c, cw(ROOT)) == cw(ROOT))
+r = req(2, 0, struct.pack('<IIII', ROOT, 1 | 1 << 11, 0, 1 << 20 | 1 << 22))
+check('CWA root keeps only the event mask, without redirection', run(c, r) == req(2, 0, struct.pack('<III', ROOT, 1 << 11, 1 << 22)))
+cp = lambda window, prop: req(18, 0, struct.pack('<IIIB3xI', window, prop, 31, 8, 0))
+check('ChangeProperty on root dropped', run(c, cp(ROOT, 400)) == NOOP)
+check('ChangeProperty on a host window dropped', run(c, cp(OTHER, 900)) == NOOP)
+check('ChangeProperty own passed', run(c, cp(OWN, 400)) == cp(OWN, 400))
+c.sf(struct.pack('<BxHIIIIII4x', 30, 0, 0, OWN, OTHER, CLIPBOARD, 31, 900))
+check('ChangeProperty answering a selection request passed', run(c, cp(OTHER, 900)) == cp(OTHER, 900))
+check('ChangeProperty of another property dropped', run(c, cp(OTHER, 901)) == NOOP)
+check('DeleteProperty on root dropped', run(c, req(19, 0, struct.pack('<II', ROOT, 400))) == NOOP)
+check('GetProperty on root never deletes', run(c, req(20, 1, struct.pack('<IIIII', ROOT, 400, 0, 0, 100))) == req(20, 0, struct.pack('<IIIII', ROOT, 400, 0, 0, 100)))
+check('PutImage on a host window dropped', run(c, req(72, 2, struct.pack('<II', OTHER, 0) + bytes(16))) == NOOP)
+big = struct.pack('<BBHII', 72, 2, 0, 1 + 1 + 20000, OTHER) + bytes(79996)
+check('big PutImage on a host window dropped', run(c, big[:5000]) + run(c, big[5000:]) == NOOP)
+check('CopyArea to a host window dropped', run(c, req(62, 0, struct.pack('<IIIhhhhHH', OWN, OTHER, OWN2, 0, 0, 0, 0, 1, 1))) == NOOP)
+for op, name in ((51, 'SetFontPath'), (100, 'ChangeKeyboardMapping'), (109, 'ChangeHosts'), (111, 'SetAccessControl')):
+  check(f'{name} denied', run(c, req(op, 0, b'')) == GIF and c.pending[-1][2][0] == m.BAD_ACCESS)
+check('GrabServer dropped', run(c, req(36, 0, b'')) == NOOP)
+check('KillClient AllTemporary dropped', run(c, req(113, 0, struct.pack('<I', 0))) == NOOP)
+check('KillClient of a host application dropped', run(c, req(113, 0, struct.pack('<I', OTHER))) == NOOP)
+check('GrabPointer while unfocused faked', run(c, req(26, 0, struct.pack('<IHBBIIIxxxx', OWN, 0, 1, 1, 0, 0, 0))) == GIF)
+check('WarpPointer while unfocused dropped', run(c, req(41, 0, struct.pack('<IIhhHHhh', 0, OWN, 0, 0, 0, 0, 1, 1))) == NOOP)
+check('XKB SetMap denied', run(c, req(134, 9, bytes(12))) == GIF)
+check('XKB GetKbdByName loading a keymap denied', run(c, req(134, 23, struct.pack('<HHHB3x', 0x100, 0, 0, 1))) == GIF)
+r = req(134, 23, struct.pack('<HHHB3x', 0x100, 0, 0, 0)); check('XKB GetKbdByName without loading passed', run(c, r) == r)
+check('RANDR SetCrtcConfig denied', run(c, req(138, 21, bytes(24))) == GIF)
+check('XIChangeHierarchy denied', run(c, req(130, 43, struct.pack('<BxH', 0, 0))) == GIF)
+check('Xv GetStill denied', run(c, req(139, 8, bytes(28))) == GIF)
+
+# Selections and focus need user input in the sandbox
+c = client()
+c.server.focus_window = OTHER
+so = lambda owner, sel: req(22, 0, struct.pack('<III', owner, sel, 0))
+check('SetSelectionOwner CLIPBOARD without input dropped', run(c, so(OWN, CLIPBOARD)) == NOOP)
+check('SetSelectionOwner with a host window dropped', run(c, so(OTHER, 999)) == NOOP)
+r = so(OWN, 999); check('SetSelectionOwner of another selection passed', run(c, r) == r)
+sf = lambda window: req(42, 1, struct.pack('<II', window, 0))
+check('SetInputFocus while unfocused dropped', run(c, sf(OWN)) == NOOP)
+check('XISetFocus while unfocused dropped', run(c, req(130, 49, struct.pack('<IIH2x', OWN, 0, 3))) == NOOP)
+c.sf(struct.pack('<BBHIII16x', 33 | 0x80, 32, 0, OWN, PROTOCOLS, TAKE_FOCUS))
+check('SetInputFocus after WM_TAKE_FOCUS passed', run(c, sf(OWN)) == sf(OWN))
+check('SetInputFocus to a host window dropped', run(c, sf(OTHER)) == NOOP)
+c.proxy.focus_until = 0
+c.server.focus_window = OWN
+c.sf(key(2, 38, 0))
+check('SetInputFocus while focused passed', run(c, sf(OWN2)) == sf(OWN2))
+check('SetSelectionOwner CLIPBOARD after input passed', run(c, so(OWN, CLIPBOARD)) == so(OWN, CLIPBOARD))
+check('SetSelectionOwner WM_S0 dropped', run(c, so(OWN, WM_S0)) == NOOP)
+
+# SendEvent
+c = client()
+se = lambda dest, ev: req(25, 0, struct.pack('<II', dest, 0) + ev)
+msg = lambda window, kind, data = 0: struct.pack('<BBHIII16x', 33, 32, 0, window, kind, data)
+check('WM_PROTOCOLS to a host window dropped', run(c, se(OTHER, msg(OTHER, PROTOCOLS))) == NOOP)
+r = se(ROOT, msg(OWN, 999)); check('ClientMessage to root about an own window passed', run(c, r) == r)
+check('ClientMessage to root about a host window dropped', run(c, se(ROOT, msg(OTHER, 999))) == NOOP)
+r = se(OTHER, msg(OTHER, XEMBED)); check('_XEMBED to a host window passed', run(c, r) == r)
+check('WM_TAKE_FOCUS to an own window dropped', run(c, se(OWN, msg(OWN, PROTOCOLS, TAKE_FOCUS))) == NOOP)
+check('SelectionRequest to a host window dropped', run(c, se(OTHER, struct.pack('<BxHIIIIII4x', 30, 0, 0, OTHER, OWN, CLIPBOARD, 31, 900))) == NOOP)
+r = se(OTHER, struct.pack('<BxHIIIII8x', 31, 0, 0, OTHER, CLIPBOARD, 31, 900)); check('SelectionNotify to a host window passed', run(c, r) == r)
+check('Expose to a host window dropped', run(c, se(OTHER, struct.pack('<B31x', 12))) == NOOP)
+r = se(ROOT, struct.pack('<BxHIIB19x', 18, 0, ROOT, OWN, 0)); check('UnmapNotify to root withdrawing an own window passed', run(c, r) == r)
+
+print(f'FAILED {fails}' if fails else 'all passed')
+sys.exit(1 if fails else 0)

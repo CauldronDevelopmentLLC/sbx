@@ -1,111 +1,37 @@
 # sbx
 
-A tool for easily sandboxing applications in Linux.
+Sandbox AI agents and untrusted software on Linux.
 
-Linux is generally considered a secure operating system.  However, when you
-run a program that program is by default given the same access as your user.
-Malicious software can easily install something bad in your user start up
-scripts or steal data such as the private keys stored in ``~/.ssh``, make a
-copy of your crypto wallet or steal your browsing history.  This risk might
-be acceptable for the packages provided by your operating system.  Presumably
-these have been vetted.  However, if you run tools like ``npm``,
-``pip`` or ``vscode`` which pull arbitrary code from hundreds of different
-sources and run them with full access to all your personal files, that's
-another story.  sbx aims to solve this problem by making it easier to
-sandbox applications and give them only the access they require to operate.
+In typical setups, AI agents and 3rd party software run with full access to
+your login account.  They can read ``~/.ssh``, alter startup scripts, copy
+browser data or even read your passwords in the background as you type them.
+That may be an acceptable access level for vetted distribution packages, but
+not for untrusted code from sources like ``npm``, ``pip`` or VSCode or
+extensions.  sbx makes it possible to give each application only the access
+it needs.
 
-sbx uses [bubblewrap](https://github.com/containers/bubblewrap)
-and [xdg-dbus-proxy](https://github.com/flatpak/xdg-dbus-proxy) to sandbox
-applications in Linux.  Based on
-[code by Simon Lipp](https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d).  See
-[Simon's blog post](https://sloonz.github.io/posts/sandboxing-3/) for more
-information.
+sbx uses [bubblewrap](https://github.com/containers/bubblewrap) and gives
+sandboxes their own D-Bus session bus and
+[XDG Desktop Portal](https://flatpak.github.io/xdg-desktop-portal/).
+Inspired by [code from Simon Lipp](https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d),
+see [his blog post](https://sloonz.github.io/posts/sandboxing-3/).
 
 # Install
 
-First install the required packages.  On Debian run:
+On Debian:
 
-    sudo apt-get install -y python3 bubblewrap xdg-dbus-proxy
+    sudo apt-get install -y python3 python3-yaml python3-seccomp python3-gi \
+      bubblewrap dbus-daemon xauth passt iproute2 xdg-desktop-portal-gtk
+    make install
 
-Then, following manual install is recommended:
+``util-linux`` 2.39 or later is needed.  ``make install`` copies ``sbx``,
+``sbx-portal`` and ``sbx-x11`` to ``~/.local/bin``, or ``$PREFIX/bin``, which
+must be on your ``PATH``.  It copies ``global.yml`` to ``~/.config/sbx``
+unless one exists, otherwise it shows how to merge the changes.  Install by
+copying, never by linking to a checkout which a sandbox can write.  ``make
+check`` runs the tests.  See also *Display* below.
 
-```sh
-mkdir -p ~/.config/sbx
-cp global.yml ~/.config/sbx
-mkdir -p ~/.local/bin
-cp sbx ~/.local/bin
-```
-
-Make sure ``~/.local/bin`` is on your path.  Perhaps by adding the following
-line to your ``~/.bashrc`` file:
-
-```sh
-export PATH=$HOME/.local/bin:$PATH
-```
-
-# Quickstart
-
-Create a new sandbox:
-
-    sbx create <name> <executable> <args>...
-
-To create a sandbox from a template:
-
-    sbx create <name> -t <template> <executable> <args>...
-
-Templates live in ``~/.local/share/sbx-templates/<template>/`` and consist
-of a ``config.yml`` and an optional ``home/`` directory whose contents are
-copied into the new sandbox's home.  Any other files in the template
-directory (e.g. hook scripts) are copied verbatim into the sandbox config
-directory.  See ``sbx template`` below for creating templates from existing
-sandboxes.
-
-When creating a sandbox with ``-t``, ``--rule`` and command overrides are
-not allowed; the template is copied as-is.
-
-You can edit the sandbox config with:
-
-    sbx edit <name>
-
-Note, editing requires that the ``EDITOR`` environment variable is set
-correctly.
-
-Finally, run your sandbox:
-
-    sbx run <name> <args>...
-
-``sbx run`` propagates the sandboxed command's exit code (a non-zero
-``post-hook`` exit code takes precedence).
-
-To save an existing sandbox as a reusable template:
-
-    sbx template <name> <template-name>
-
-This copies the sandbox's config and home directory to
-``~/.local/share/sbx-templates/<template-name>/``.  Use ``-f`` to overwrite
-an existing template.  The template can then be used with
-``sbx create <new-name> -t <template-name>``.
-
-# Example (sandboxing npm)
-
-Create a sandbox for ``npm``:
-
-    sbx create npm -r cli npm
-
-The first ``npm`` is the name of the new sandbox.  ``-r cli`` applies the
-rule for command line programs.  The second ``npm`` is the command to run.
-
-Now you can run sandboxed ``npm`` to build a project in the current directory:
-
-    sbx run npm run build
-
-Note that if you want to pass any argument starting with ``-`` to your sandbox
-and not to ``sbx`` then you will need to add ``--`` like this:
-
-    sbx run npm -- --help
-
-# Command line
-``sbx`` takes one of the following subcommands:
+# Usage
 
     create       create a new sandbox
     run          run an existing sandbox
@@ -115,359 +41,349 @@ and not to ``sbx`` then you will need to add ``--`` like this:
     list-rules   list available rules
     delete       delete an existing sandbox
     show         print sandbox config and exit
-    edit         edit sandbox config
+    edit         edit sandbox config with $EDITOR
     template     create a template from an existing sandbox
-    help         show this help message and exit
 
-To see the help for a subcommand run:
+See ``sbx <subcommand> --help``.  For example, to sandbox ``npm``:
 
-    sbx <subcommand> --help
+    sbx create npm -r cli npm    # Sandbox "npm" using rule "cli" runs "npm"
+    sbx run npm run build
+    sbx run npm -- --help        # "--" passes options to the command
+
+``sbx run`` returns the command's exit code, unless the ``post-hook`` fails.
+
+``sbx enter <name>`` starts a login shell in a running sandbox, on the current
+terminal, with the same restrictions as the sandbox's processes.  It needs no
+privileges.  If several instances are running, give a PID from ``sbx ps``.
+
+``sbx template <name> <template>`` saves a sandbox's config directory and
+home to ``~/.local/share/sbx-templates/<template>/``.  ``sbx create <name> -t
+<template>`` creates a sandbox from it, as is, so ``-r`` and a command are not
+allowed.
 
 # Configuration
 
-sbx uses a [YAML](https://yaml.org/) configuration file.  A config
-consists of a top-level dictionary containing any of the following keys:
+A sandbox's ``config.yml`` may contain:
 
-- ``use``         - A list of rules to use by default.
-- ``command``     - A list containing the default command and any arguments.
-- ``imports``     - A list of paths to other configs to import rules from.
-- ``rules``       - A dictionary containing all the applicable rules.
-- ``create-hook`` - Shell command run after the sandbox is created.
-- ``pre-hook``    - Shell command run before the sandbox command starts.
-- ``post-hook``   - Shell command run after the sandbox command exits.
-- ``delete-hook`` - Shell command run before the sandbox is deleted.
+- ``use``     - Rules to apply.  Set by ``sbx create``, overridden by ``-r``.
+- ``command`` - Command and arguments.  In ``global.yml``, the default for new
+  sandboxes.
+- ``imports`` - Configs to import rules from, relative to the importing file.
+  Later imports override earlier ones and the importing config overrides all.
+- ``rules``   - Named lists of actions, see *Actions*.  If the first item is a
+  string, it is the rule's help shown by ``sbx list-rules``.
+- ``create-hook``, ``pre-hook``, ``post-hook``, ``delete-hook`` - See *Hooks*.
 
-For example:
+Example, the complete config for the game
+[Mindustry](https://mindustrygame.github.io/) with the jar in the sandbox's
+home:
 
 ```yaml
-use: [gui, gpu]
+use: [gui, gpu, audio]
 command: [java, -jar, Mindustry.jar]
 imports: [$HOME/.config/sbx/global.yml]
 ```
 
-The above is a complete config for a sandbox that runs the game
-[Mindustry](https://mindustrygame.github.io/).  The jar file must be placed
-in the sandbox's home directory and Java must be installed on the host system.
-The ``gui`` rule allows access to the Graphical User Interface and the
-``gpu`` rule access to the GPU.
+``global.yml`` defines many rules, see ``sbx list-rules``.
 
-## Variable replacement
+## Variables
 
-Parameter strings in a config may contain environment variable references
-like ``$NAME`` or ``${NAME}``.
-
-Example:
-
-```yaml
-rules:
-  private-home:
-    - bind:
-        path: $SANDBOX_HOME
-        dst: $HOME
-        read-write: true
-        create: skel
-    - dir: $HOME/.config
-    - dir: $HOME/.cache
-    - dir: $HOME/.local/share
-```
-
-The above rule creates a private home directory with several subdirectories.
-
-You may also use ``~`` instead of ``$HOME``.
-
-A few environment variables are defined by sbx itself these are:
-
-- ``SANDBOX``        - The name of the current sandbox.
-- ``SANDBOX_HOME``   - A home directory for the sandbox.
-- ``SANDBOX_CONFIG`` - The path to the sandbox's config file.
-- ``SANDBOX_ROOT``   - sbx's root config directory.
-
-Note, these variables may be used in configs but are not automatically passed
-to the sandboxed process.
-
-## Key: ``use: [<rule1>, <rule2>, ...]``
-
-When ``use`` is specified at the top level of the sandbox config file, the
-rules it lists will be applied unless ``-r <rule>`` is passed.  ``use`` is
-first set when the sandbox is created.
-
-For example:
-
-```yaml
-use: [gui, gpu, downloads]
-```
-
-## Key: ``command: [<command>, <arg1>, ...]``
-
-When ``command`` is specified at the top level of a sandbox config it
-specifies the command to run in the sandbox and its arguments.
-
-When ``command`` is specified in sbx's global config file it specifies
-the default command and arguments to apply to new sandboxes.
-
-## Key: ``imports: [<path>...]``
-
-Imports may be relative or absolute paths.  Paths are interpreted relative
-to the importing file.
-
-Imported rules override previously imported rules.  However, the rules in
-the config doing the importing take precedence over the imported rules.
-
-## Key: ``rules: {...}``
-
-Under the ``rules`` key are arbitrary named rules containing lists of
-configuration actions.  If the first item in a rule's list is a string
-it is the rule's help which you can see with ``sbx list-rules``.
-
-For example, a simple config with two rules that runs
-``bash`` and binds three read-only directories could look like this:
-
-```yaml
-use: [bin, lib]
-command: [bash]
-rules:
-  bin:
-    - Binds the /bin and /usr/bin directories read-only.
-    - bind: /bin
-    - bind: /usr/bin
-  lib:
-    - Binds the /lib directory read-only.
-    - bind: /lib
-```
-
-Rules are referenced by name with the ``use`` top-level key or a ``use``
-action.
-
-Of course, the above example is not very useful.  You need more
-complicated rules in most cases.  Many useful rules are already defined in
-``global.yml``.
+Strings may reference environment variables, ``$NAME`` or ``${NAME}``, and
+``~``.  sbx sets ``SANDBOX``, ``SANDBOX_HOME``, ``SANDBOX_CONFIG``,
+``SANDBOX_ROOT`` and ``APP_NAME`` (``org.sbx.<sandbox>``).  They are not
+passed to the sandbox unless set with ``env``.
 
 ## Hooks
 
-The ``create-hook``, ``pre-hook``, ``post-hook`` and ``delete-hook`` keys
-specify shell commands that run on the host (outside the sandbox) at the
-named lifecycle points:
+Shell commands run on the host with ``bash -c``:
 
-- ``create-hook`` runs after ``sbx create`` writes the sandbox config.
-- ``pre-hook``    runs before ``sbx run`` starts the sandboxed command.
-- ``post-hook``   runs after the sandboxed command exits.  The exit code
-  is available as ``$SANDBOX_EXIT_CODE``.
-- ``delete-hook`` runs before ``sbx delete`` removes any files.
+- ``create-hook`` - After ``sbx create``.
+- ``pre-hook``    - Before the command starts.
+- ``post-hook``   - After the command exits, with ``$SANDBOX_EXIT_CODE``.
+- ``delete-hook`` - Before ``sbx delete`` removes any files.
 
-Hooks are run with ``bash -c`` and inherit the parent environment plus
-``SANDBOX``, ``SANDBOX_HOME``, ``SANDBOX_CONFIG`` and ``SANDBOX_ROOT``.
-The sandbox config directory is prepended to ``PATH`` so hook scripts
-shipped alongside ``config.yml`` (for example via a template) can be
-invoked by name.  A non-zero hook exit code aborts the operation.
-
-Example:
+Hooks get the variables above and the sandbox's config directory is prepended
+to ``PATH``, so scripts shipped with ``config.yml`` can be called by name.  A
+non-zero exit code aborts the operation.
 
 ```yaml
 pre-hook: setup.sh
 post-hook: cleanup.sh "$SANDBOX_EXIT_CODE"
 ```
 
-### Action: ``args: [<arg>...]``
-A list of arbitrary additional arguments to pass to ``bwrap``.
+# Security
 
-Example:
-```yaml
-rules:
-  common:
-    - args: [--clearenv, --unshare-pid]
+## Syscall filter
+
+Every sandbox runs under a seccomp filter which blocks kernel interfaces
+rarely needed by applications but often used by kernel exploits.  It blocks
+these groups:
+
+- ``sockets``  - Socket families other than ``AF_UNIX``, ``AF_INET``,
+  ``AF_INET6`` and ``AF_NETLINK``, e.g. ``AF_ALG``.
+- ``io-uring`` - ``io_uring_setup``, ``io_uring_enter``,
+  ``io_uring_register``.
+- ``keyring``  - ``keyctl``, ``add_key``, ``request_key``.
+- ``userns``   - Creating user namespaces.  Chromium, Electron and other
+  programs with their own sandbox need the ``userns`` rule.
+
+Use ``allow-syscalls`` to unblock a group.  Terminal input injection
+(``TIOCSTI``, ``TIOCLINUX``) and non-native syscalls, e.g. from 32-bit
+binaries, are always blocked.
+
+## Network
+
+Each sandbox gets its own network namespace with internet access through
+``pasta``.  Policy rules in the namespace block private, shared, link-local
+and multicast ranges, IPv4 and IPv6, and the host's own addresses.  So a
+sandbox cannot reach the LAN, VPNs, services on the host or the host's
+abstract Unix sockets.  DNS goes to the host's resolver through ``pasta``.
+The host's firewall is not involved.
+
+Rules which relax this:
+
+- ``host-net`` - Share the host's network.
+- ``cups``     - The host's CUPS on ``localhost:631``.
+
+``no-net`` gives loopback only.  ``allow-net`` unblocks ranges or single TCP
+ports, e.g. a VPN's subnet, but not the host's addresses.
+
+Proxies in sbx's ``http_proxy``, ``https_proxy``, ``ftp_proxy`` and
+``all_proxy``, or their upper case forms, are allowed automatically, only on
+their port.  A proxy on the host's loopback is forwarded as with
+``host-port``.  Hostnames are resolved when the sandbox starts.
+
+## D-Bus and portals
+
+Sandboxes never connect to the host's session bus.  With the ``portal`` or
+``dbus-forward`` actions, sbx gives a sandbox a private bus, served by
+``sbx-portal``, with:
+
+- ``file-chooser`` - Files are chosen in the host's dialog and only those are
+  exposed, via the host's document portal.
+- ``open-uri``     - ``http``, ``https`` and ``mailto`` links open in the
+  host's default application.  Files open only after the user picks an
+  application.  Executables are refused.
+- ``print``        - Printing via the host's print dialog.  Browsers' own print
+  previews need CUPS, see the ``cups`` rule, otherwise use their system
+  dialog, e.g. Chrome's Ctrl+Shift+P or Firefox's
+  ``print.prefer_system_dialog``.
+- ``settings``, ``network-monitor``, ``proxy-resolver`` - Forwarded to the
+  host's portal.
+- ``dbus-forward`` names - Forwarded to the host's bus.
+
+Nothing else is available and the bus cannot start services.  Dialogs use
+the host's portal backend, e.g. ``xdg-desktop-portal-gtk``.
+
+sbx does not pretend to be Flatpak, i.e. there is no ``/.flatpak-info``,
+because libraries then expect other Flatpak tools.  The ``dbus`` rule sets
+environment variables which make GTK, GLib and Qt use portals.  Some
+applications need their own setting, e.g. Firefox's
+``widget.use-xdg-desktop-portal.file-picker``.
+
+All instances of a sandbox share one bus, so single instance applications
+work.  It stops after the last instance exits, so configuration changes apply
+once all instances have exited.  The bus and ``portal.log`` are in
+``$XDG_RUNTIME_DIR/sbx/<sandbox>/``.
+
+## Display
+
+### X11
+
+There are three levels of access:
+
+- ``x11`` (filtered) - Clients connect to ``sbx-x11``, a proxy which forwards
+  their requests with the host's credentials but drops those which read or
+  inject other clients' input or read their windows.
+- ``x11-untrusted`` - The X server's SECURITY extension restricts clients.
+  Each run gets a new cookie, revoked after the sandbox's last process exits.
+- ``x11-trusted`` - Full access, also with a per run cookie.
+
+|                                              | ``x11`` | untrusted | trusted |
+|----------------------------------------------|---------|-----------|---------|
+| Read keystrokes or inject input              | blocked | blocked   | yes     |
+| Capture other windows or the screen          | mostly  | blocked   | yes     |
+| GPU rendering, MIT-SHM, themed cursors       | yes     | no        | yes     |
+| Paste from host                              | yes     | yes       | yes     |
+| Copy to host                                 | yes     | no        | yes     |
+| Read the clipboard without pasting           | blocked | yes       | yes     |
+| Read other windows' titles                   | blocked | yes       | yes     |
+
+``sbx-x11`` hides extensions it does not know, including RECORD and XTEST,
+zeroes ``QueryKeymap`` and XKB keycodes, and blocks key event selection,
+grabs and synthetic input on other clients' windows, and reads of other
+clients' drawables via core requests, MIT-SHM, RENDER, Composite, DAMAGE,
+DBE, DRI3 and GLX.  It also:
+
+- Allows reading a selection owned outside the sandbox for 2 seconds after a
+  paste action in a focused sandbox window, and only from the owner at the
+  first read.  CLIPBOARD: ``Ctrl+V``, ``Ctrl+Shift+V``, ``Shift+Insert``,
+  left or right click.  PRIMARY: middle click, ``Shift+Insert``.  Dropping
+  from the host allows reading the dragged data.
+- Allows keyboard grabs only while a sandbox window has the focus and drops
+  key events while it does not, so a grab cannot capture keys typed
+  elsewhere, only swallow them.
+- Allows reading only properties needed for drag and drop, embedding and
+  settings, e.g. ``WM_STATE``, on other clients' windows.  Titles, class,
+  command line, PID and icons are hidden, and data pasted in host
+  applications cannot be read in transit.
+- Blocks changes to other clients' windows: mapping, moving, destroying,
+  reparenting, drawing on them, creating windows inside them, their
+  properties, except to answer a paste from the sandbox, and synthetic events
+  other than selection, drag and drop and embedding messages.
+- Blocks server wide changes: keyboard and pointer mappings and settings, XKB
+  keymaps and controls, XInput devices, font path, access control, screen
+  configuration, ``GrabServer`` and ``KillClient`` of other clients.
+- Allows setting the focus, taking CLIPBOARD or PRIMARY and pointer warps
+  only while a sandbox window has the focus or within 2 seconds of user input
+  in the sandbox, drag messages only while a button pressed in the sandbox is
+  held, and never taking manager selections, e.g. the window manager's.
+
+Limits: with ``PointerRoot`` focus, e.g. some focus follows mouse setups, key
+events are not checked.  Without a compositing manager, a client can read
+the screen's contents under its own windows where they are unpainted or
+overlapped.  Vendor extensions such as NVIDIA's ``NV-GLX`` are passed
+unfiltered.  With ``-v``, denials are logged to
+``$XDG_RUNTIME_DIR/sbx/<sandbox>/x11.log``.
+
+The proxy adds latency to every round trip, about 20 µs when idle and more
+when the X server is busy between requests.  Applications which wait for the
+server after each drawing operation slow down most, e.g. x11perf's
+``PutImage`` and ``ShmPutImage`` run at about a quarter of the direct rate.
+GPU rendered applications, which send little X traffic, are hardly affected.
+
+If the X server grants access by user, which Debian does by default, any
+sandbox which reaches its socket gets trusted access, since sandboxes run as
+your user.  ``x11-untrusted`` binds the socket and ``host-net`` exposes its
+abstract socket, so sbx warns in these cases.  To remove the grant, once
+``xauth list "$DISPLAY"`` shows a cookie:
+
+```sh
+sudo dpkg-divert --local --rename --add \
+  --divert /etc/X11/Xsession.d/35x11-common_xhost-local.disabled \
+  /etc/X11/Xsession.d/35x11-common_xhost-local
+xhost -si:localuser:$USER
 ```
 
-### Action: ``bind: {...}``
-The argument to bind may be a simple string in which case it describes a path
-to bind in read-only mode.
+### Wayland
 
-Example:
+Wayland clients cannot see each other's input, windows or clipboard and
+render on the GPU.  However, wlroots compositors such as Sway offer every
+client privileged protocols, e.g. ``virtual-keyboard`` (input injection),
+``wlr-screencopy`` (screen capture), ``wlr-data-control`` (clipboard) and
+``foreign-toplevel`` (window list).  The ``wayland`` rule binds the
+compositor's socket unfiltered, so sandboxes get these.  Filtering needs a
+``security-context-v1`` socket per sandbox, which is not implemented yet.
+X11 applications under Xwayland share one X server, see *X11*.
+
+## Limitations
+
+- Anything a sandbox can write which the host later runs is a way out, e.g.
+  a bound project's scripts or ``.git/hooks`` when git runs on the host.
+- Sandboxes share the host's kernel.  A kernel or driver bug can be a way
+  out, see also ``userns`` and ``gpu``.
+- ``sbx-x11`` and ``sbx-portal`` run on the host, unsandboxed, and parse
+  requests from sandboxes.
+- The network is filtered by address, not hostname.  A VPN which routes
+  public addresses is reachable.
+- ``audio`` includes the microphone.
+- ``accessibility`` lets a sandbox read text from other applications.
+- ``gpu`` exposes the GPU driver's kernel interface.
+
+# Actions
+
+### ``allow-net: <net> | [<net>...]``
+Unblock ``<cidr>`` or one TCP port, ``<addr>:<port>`` or ``[<addr>]:<port>``
+for IPv6, see *Network*.
+
+### ``allow-syscalls: <group> | [<group>...]``
+Unblock syscall groups, see *Syscall filter*.
+
+### ``args: [<arg>...]``
+Pass arguments to ``bwrap``, e.g. ``args: [--unshare-pid]``.
+
+### ``bind: <path> | {...}``
+Bind a host path, read-only by default.  Keys:
+
+- ``path``       - Source path.
+- ``dst``        - Destination path, defaults to ``path``.
+- ``read-write`` - Writable bind.
+- ``dev``        - Allow device access.
+- ``try``        - Skip if ``path`` does not exist.
+- ``cwd``        - Use the current directory as ``path``.
+- ``create``     - Create ``path`` if missing.  ``skel`` also fills it from
+  ``/etc/skel``, see ``skel``.
+- ``perms``      - Permissions of the destination, e.g. ``0o700``.
+
+### ``chdir: <path>``
+Set the working directory.
+
+### ``dbus-forward: <name> | [<name>...]``
+Forward D-Bus names to the host's session bus, see *D-Bus and portals*.
+
+### ``dev: <path> | {path: <path>, perms: <perms>}``
+Mount a new ``/dev``.
+
+### ``die-with-parent: <bool>``
+Kill the sandbox when sbx exits.  Set by ``common``.  ``false`` lets it
+outlive sbx, e.g. when the command starts an application and returns.
+
+### ``dir: <path> | {path: <path>, perms: <perms>}``
+Create a directory.
+
+### ``env: [<name>...] | {<name>: <value>...}``
+Copy variables from sbx's environment, if set, or set them.
+
 ```yaml
-rules:
-  x11:
-    - bind: /tmp/.X11-unix/
+- env: {PATH: /usr/bin:/bin}
+- env: [LANG, TERM]
 ```
 
-Or it may be a dictionary with the following optional keys:
+### ``file: <path> | {path: <path>, data: <data>, perms: <perms>}``
+Create a file containing ``data``, empty by default.
 
-- ``path: <string>``
-  The source path to bind.  Also the destination if ``dst`` is not specified.
+### ``hide: <path> | [<path>...]``
+Hide host paths.  Directories are covered with a ``tmpfs``, files with
+``/dev/null``.  Missing paths are skipped.
 
-- ``dst: <string>``
-  The destination path to bind.  Defaults to the same path as the source.
+### ``host-port: <port> | [<port>...]``
+Forward TCP ports on the sandbox's ``localhost`` to the host's.
 
-- ``read-write: <bool>``
-  If true the bind will be writeable, otherwise it's read-only.
+### ``ifdef: [<var>, <action>...]``
+Apply the actions if the variable is set in sbx's environment, e.g.
+``ifdef: [DISPLAY, {x11: untrusted}]``.
 
-- ``create: <bool> | 'skel'``
-  If true, the destination directory will be created if it does not already
-  exist.
+### ``ifeq: [<value1>, <value2>, <action>...]``, ``ifneq: ...``
+Apply the actions if the values, after variable replacement, are equal or
+not equal.
 
-  If the special value `skel` is specified then the contents of
-  ``/etc/skel`` will be copied to the destination directory when it is first
-  created.  This is useful to setup a new sandbox home directory.  Note,
-  if ``.bashrc`` exists in ``/etc/skel`` the name of the sandbox will be added
-  to the command prompt.
+### ``net: host | isolated | none``
+Network access, ``isolated`` by default, see *Network*.  If several are
+requested, the most permissive wins.
 
-- ``try: <bool>``
-  If true and the source directory does not exist then the bind will quietly
-  be ignored.
+### ``portal: <portal> | [<portal>...]``
+Enable portals, see *D-Bus and portals*.
 
-- ``cwd: <bool>``
-  If true the current directory will be taken as the source path.
+### ``proc: <path> | {path: <path>, perms: <perms>}``
+Mount a new ``/proc``.
 
-### Action: ``chdir: <path>``
-Change directories inside the sandbox.
+### ``skel: <path>``
+Copy ``/etc/skel`` to the path, without overwriting, and add the sandbox's
+name to the bash prompt.
 
-Example:
-```yaml
-rules:
-  example:
-    - bind: $HOME/tmp
-    - chdir: $HOME/tmp
-```
+### ``symlink: [<target>, <path>]``
+Create a symlink, e.g. ``symlink: [usr/bin, /bin]``.
 
-### Action: ``dbus: {...}``
+### ``tmp-overlay: {path: <path>, skel: true}``
+Mount a writable directory, filled from ``/etc/skel``, whose changes are
+discarded on exit.
 
-Parameters are:
+### ``tmpfs: <path> | {path: <path>, size: <bytes>, perms: <perms>}``
+Mount a ``tmpfs``.
 
-- ``system: <bool>``
-  Use the system dbus rather than the session dbus.
+### ``use: <rule> | [<rule>...]``
+Apply rules.
 
-- ``allow: <type> | [<type>...]``
-  Where ``<type>`` is one of ``see``, ``talk``, ``own``, ``call`` or
-  ``broadcast``.  See ``man bwrap``.
-
-- ``path: <string>``
-  A dbus path.  See ``man xdg-dbus-proxy``.
-
-### Action: ``dev: <path> | {path: <path>, perms: <perms>}``
-Create a dev file system at the specified path.  See ``tmpfs``.
-
-### Action: ``die-with-parent: <bool>``
-Enable or disable ``die-with-parent`` flag.  Causes the sandbox process to
-die if the parent process dies.  See ``bwrap`` man page for more details.
-
-Example:
-```yaml
-rules:
-  example:
-    - die-with-parent: true
-```
-
-### Action: ``dir: <path> | {path: <path>, perms: <perms>}``
-Create a directory inside the sandbox.
-
-Example:
-```yaml
-rules:
-  example:
-    - dir: $HOME/example
-```
-
-### Action: ``env: [<name>...] | {<name>: <value>...}``
-Set environment variables.  Either a list of variables to copy from the
-parent environment, if they exist, or a dictionary of name-value pairs.
-
-Note, variables are set in the sandbox's environment and so are not available
-to reference (e.g. ``$NAME``) in configs.
-
-Example:
-```yaml
-rules:
-  example:
-    - env: {PATH: /usr/bin:/bin}
-    - env: [LANG, TERM, HOME, LOGNAME, USER]
-```
-
-The above example sets the ``PATH`` and then copies the other variables from
-the parent environment to the sandbox's environment.
-
-### Action: ``file: <path> | {data: <data>, path: <path>, perms: <perms>``
-Copy the specified ``<data>`` to the target file ``<path>`` in the sandbox.
-If just a path is specified, an empty file is created.
-
-Example:
-```yaml
-rules:
-  example:
-    - file: ['Hello World!', 'hello.txt']
-```
-
-### Action: ``hide: <path> | [<path>...]``
-Hide one or more host paths from the sandbox.  Directories are masked with
-a ``tmpfs``; files are masked with a read-only bind of ``/dev/null``.
-Missing paths are silently skipped.
-
-Example:
-```yaml
-rules:
-  example:
-    - hide: [$HOME/.ssh, $HOME/.gnupg]
-```
-
-### Action: ``ifdef: [<var>, <action>...]``
-If the specified environment variable is set apply the actions.
-
-Example:
-```yaml
-rules:
-  example:
-    - ifdef: [WITH_DOWNLOADS, {use: downloads}]
-
-  downloads:
-    - bind: {path: $HOME/Downloads, read-write: true}
-```
-
-The above example applies the ``downloads`` rule if ``WITH_DOWNLOADS`` is
-set in the parent environment.
-
-### Action: ``ifeq: [<value1>, <value2>, <action>...]``
-If after variable replacement the two values are equal then apply the actions.
-
-### Action: ``ifneq: [<value1>, <value2>, <action>...]``
-If after variable replacement the two values are not equal then apply the
-actions.
-
-### Action: ``proc: <path> | {path: <path>, perms: <perms>}``
-Create a proc file system at the specified path.  See ``tmpfs``.
-
-### Action: ``restrict_tty:``
-Restrict access to the calling terminal to prevent CVE-2017-5226.
-
-### Action: ``symlink: [<src>, <dst>]``
-Create a symlink.
-
-Example:
-```yaml
-rules:
-  example:
-    - symlink: [usr/bin, /bin]
-```
-
-### Action: ``tmpfs: <path> | {path: <path>, size: <size>, perms: <perms>}``
-Create a tmp file system at the specified path.  Optionally, specify the
-size in bytes and permissions.  Permissions are numerical and usually specified in octal.
-
-Example:
-```yaml
-rules:
-  example:
-    - tmpfs:
-      path: /tmp
-      size: 10485760
-      perms: 0o700
-```
-
-### Action: ``use: [<rule1>, <rule2>, ...]``
-Apply the named rules.
-
-Example:
-```yaml
-use: [a]
-rules:
-  a:
-    - use: b, c
-  b:
-  c:
-```
+### ``x11: filtered | untrusted | trusted``
+Allow access to ``$DISPLAY``, see *X11*.  If several are requested, the most
+permissive wins.

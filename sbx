@@ -8,10 +8,20 @@ import yaml
 import shlex
 import shutil
 import fcntl
-import random
 import subprocess
+import errno
+import ctypes
+import socket
+import termios
+import json
+import ipaddress
+import signal
+import urllib.parse
 from functools import reduce
 from collections import defaultdict
+
+try: import seccomp
+except ImportError: import pyseccomp as seccomp
 
 
 XDG_CONFIG_HOME = os.environ.get('XDG_CONFIG_HOME', '$HOME/.config')
@@ -23,17 +33,28 @@ SANDBOX_CONFIG    = f'{SANDBOX_ROOT}/$SANDBOX/config.yml'
 SANDBOX_TEMPLATES = f'{XDG_DATA_HOME}/sbx-templates'
 DEFAULT_CONFIG    = f'{SANDBOX_ROOT}/global.yml'
 APP_BASE       = 'org.sbx'
-
-FLATPAK_INFO   = '''\
-[Application]
-name=%(app_name)s
-
-[Instance]
-instance-id=%(instance_id)s
-'''
+SECCOMP_GROUPS = ('sockets', 'io-uring', 'keyring', 'userns')
+X11_LEVELS     = ('trusted', 'filtered', 'untrusted') # Most permissive first
+NET_MODES      = ('host', 'isolated', 'none')         # Most permissive first
+# Private, shared, link-local and multicast ranges
+BLOCKED_NETS   = ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '169.254.0.0/16',
+                  '172.16.0.0/12', '192.168.0.0/16', '224.0.0.0/3', 'fc00::/7',
+                  'fe80::/10', 'ff00::/8')
+DNS_FORWARD    = '192.0.2.53' # TEST-NET-1, pasta maps it to the host's resolver
+NS_GET_USERNS  = 0xb701       # From linux/nsfs.h
+PR_SET_SECCOMP, PR_CAPBSET_DROP, PR_SET_NO_NEW_PRIVS = 22, 24, 38
+SECCOMP_MODE_FILTER = 2
+PROXY_VARS     = ('http_proxy', 'https_proxy', 'ftp_proxy', 'all_proxy')
 
 
 class SBError(Exception): pass
+
+
+class SockFprog(ctypes.Structure): # A seccomp filter for prctl()
+  _fields_ = [('len', ctypes.c_ushort), ('filter', ctypes.c_char_p)]
+
+
+libc = ctypes.CDLL(None, use_errno = True)
 
 
 class Dumper(yaml.Dumper):
@@ -46,7 +67,7 @@ def fork_and_write(data):
 
   if os.fork() == 0:
     os.close(pr)
-    os.write(pw, data.encode())
+    os.write(pw, data if isinstance(data, bytes) else data.encode())
     sys.exit(0)
 
   os.close(pw)
@@ -73,6 +94,24 @@ def copytree(src, dst):
         shutil.copy2(os.path.join(root, file), tgtPath)
 
 
+def display_in_use(num):
+  with socket.socket(socket.AF_UNIX) as s:
+    try: s.connect(f'\0/tmp/.X11-unix/X{num}')
+    except OSError: return os.path.exists(f'/tmp/.X11-unix/X{num}')
+  return True
+
+
+def parse_allow_net(s):
+  '''Parse "<cidr>", "<addr>:<port>" or "[<addr>]:<port>".'''
+  if s.startswith('['):
+    addr, _, port = s[1:].partition(']')
+    port = port.removeprefix(':')
+  elif s.count(':') == 1: addr, port = s.split(':')
+  else: addr, port = s, ''
+
+  return ipaddress.ip_network(addr), int(port) if port else None
+
+
 def get_pid_ns(pid = os.getpid()):
   link = os.readlink(f'/proc/{pid}/ns/pid')
   return link.split('[')[-1].rstrip(']')
@@ -82,15 +121,21 @@ class SBX:
   def __init__(self, args):
     self.args             = args
     self.cmd_args         = []
-    self.system_bus_args  = set()
-    self.session_bus_args = set()
+    self.portals          = set()
+    self.dbus_forwards    = set()
     self.loaded           = set()
     self.applied          = []
     self.rules            = {}
-    self.id               = f'sbx-{random.randint(int(1e9) + 1, int(1e10))}'
     self.runtime_dir      = os.environ['XDG_RUNTIME_DIR']
     self.tempdirs         = set()
     self.die_with_parent  = False
+    self.allowed_syscalls = set()
+    self.x11              = None
+    self.x11_auth_id      = None
+    self.portal_lock      = None
+    self.net              = None
+    self.allow_net        = set()
+    self.host_ports       = set()
 
 
   def log(self, s):
@@ -291,16 +336,40 @@ class SBX:
         self.cmd_args.extend(('--ro-bind', '/dev/null', expanded))
 
 
-  def action_dbus(self, params):
-    is_system = params.get('system', False)
-    bus_args = self.system_bus_args if is_system else self.session_bus_args
+  def action_portal(self, params):
+    if isinstance(params, str): params = [params]
+    self.portals.update(params)
 
-    allow = params.get('allow', [])
-    if not isinstance(allow, list): allow = [allow]
 
-    for type in allow:
-      assert type in ('see', 'talk', 'own', 'call', 'broadcast')
-      bus_args.add(f'--{type}={params['path']}')
+  def action_dbus_forward(self, params):
+    if isinstance(params, str): params = [params]
+    self.dbus_forwards.update(self.expand(name) for name in params)
+
+
+  def set_level(self, name, levels, value):
+    if value not in levels:
+      raise SBError(f'"{name}" requires one of: {", ".join(levels)}')
+
+    # The most permissive level wins
+    current = getattr(self, name)
+    if current is None or levels.index(value) < levels.index(current):
+      setattr(self, name, value)
+
+
+  def action_x11(self, params): self.set_level('x11', X11_LEVELS, params)
+  def action_net(self, params): self.set_level('net', NET_MODES, params)
+
+
+  def action_allow_net(self, params):
+    if isinstance(params, str): params = [params]
+    try:
+      self.allow_net.update(parse_allow_net(self.expand(net)) for net in params)
+    except ValueError as e: raise SBError(f'"allow-net": {e}')
+
+
+  def action_host_port(self, params):
+    if not isinstance(params, list): params = [params]
+    self.host_ports.update(int(port) for port in params)
 
 
   def action_file(self, params):
@@ -331,22 +400,13 @@ class SBX:
     self.cmd_args.extend(('--chdir', self.expand(params)))
 
 
-  def action_restrict_tty(self, params):
-    # --new-session breaks interactive sessions, this is an alternative way of
-    # fixing CVE-2017-5226
+  def action_allow_syscalls(self, params):
+    if isinstance(params, str): params = [params]
 
-    try:
-      import seccomp
-    except ImportError:
-      import pyseccomp as seccomp
-    import termios
-
-    f = seccomp.SyscallFilter(defaction = seccomp.ALLOW)
-    f.add_rule(seccomp.KILL_PROCESS, 'ioctl',
-               seccomp.Arg(1, seccomp.MASKED_EQ, 0xffffffff, termios.TIOCSTI))
-    f.add_rule(seccomp.KILL_PROCESS, 'ioctl',
-               seccomp.Arg(1, seccomp.MASKED_EQ, 0xffffffff, termios.TIOCLINUX))
-    f.load()
+    for group in params:
+      if group not in SECCOMP_GROUPS:
+        raise SBError(f'Unknown syscall group "{group}"')
+      self.allowed_syscalls.add(group)
 
 
   def action_ifeq(self, params, ifneq = False):
@@ -390,54 +450,344 @@ class SBX:
     self.fs_arg(params, 'tmpfs')
 
 
-  def setup_dbus_proxy(self):
-    if not (self.session_bus_args or self.system_bus_args): return
+  def setup_seccomp(self):
+    f = seccomp.SyscallFilter(defaction = seccomp.ALLOW)
+    allowed = self.allowed_syscalls
 
-    args = []
-    dir  = f'{self.runtime_dir}/xdg-dbus-proxy'
+    def block(err, syscall, *args):
+      f.add_rule(seccomp.ERRNO(err), syscall, *args)
 
-    os.makedirs(dir, exist_ok = True)
+    # --new-session breaks interactive sessions, this is an alternative way of
+    # fixing CVE-2017-5226
+    for req in (termios.TIOCSTI, termios.TIOCLINUX):
+      f.add_rule(seccomp.KILL_PROCESS, 'ioctl',
+                 seccomp.Arg(1, seccomp.MASKED_EQ, 0xffffffff, req))
 
-    if self.session_bus_args:
-      socket   = tempfile.mktemp(prefix = 'session-', dir = dir)
-      bus_addr = os.environ['DBUS_SESSION_BUS_ADDRESS']
-      args.extend([bus_addr, socket, '--filter'] + list(self.session_bus_args))
-      self.cmd_args.extend((
-        '--bind', socket, bus_addr.removeprefix('unix:path='),
-        '--setenv', 'DBUS_SESSION_BUS_ADDRESS', bus_addr))
+    if 'sockets' not in allowed:
+      allow = (socket.AF_UNSPEC, socket.AF_UNIX, socket.AF_INET,
+               socket.AF_INET6, socket.AF_NETLINK)
+      deny  = [seccomp.Arg(0, seccomp.EQ, family)
+               for family in range(max(allow)) if family not in allow]
+      deny.append(seccomp.Arg(0, seccomp.GT, max(allow)))
+      for arg in deny: block(errno.EAFNOSUPPORT, 'socket', arg)
 
-    if self.system_bus_args:
-      socket = tempfile.mktemp(prefix = 'system-', dir = dir)
-      path   = '/run/dbus/system_bus_socket'
-      args.extend([path, socket, '--filter'] + list(self.system_bus_args))
-      self.cmd_args.extend(('--bind', path, path))
+    if 'io-uring' not in allowed:
+      for call in ('io_uring_setup', 'io_uring_enter', 'io_uring_register'):
+        block(errno.ENOSYS, call)
 
-    if self.args.verbose: args.append('--log')
+    if 'keyring' not in allowed:
+      for call in ('keyctl', 'add_key', 'request_key'):
+        block(errno.ENOSYS, call)
 
-    # Wrap proxy
-    data = {'app_name': os.environ['APP_NAME'], 'instance_id': self.id}
-    data = FLATPAK_INFO % data
-    fd = fork_and_write(data)
-    cmd = ['bwrap', '--new-session', '--symlink', '/usr/lib64', '/lib64',
-      '--ro-bind', '/usr/lib', '/usr/lib', '--ro-bind', '/usr/lib64',
-      '/usr/lib64', '--ro-bind', '/usr/bin', '/usr/bin', '--clearenv',
-      '--bind', self.runtime_dir, self.runtime_dir,
-      '--ro-bind-data', f'{fd}', '/.flatpak-info',
-      '--die-with-parent', '--']
+    if 'userns' not in allowed:
+      for call in ('unshare', 'clone'):
+        block(errno.EPERM, call, seccomp.Arg(
+          0, seccomp.MASKED_EQ, os.CLONE_NEWUSER, os.CLONE_NEWUSER))
+      block(errno.ENOSYS, 'clone3') # Flags not filterable, force clone()
 
-    # Start dbus proxy
-    pr, pw = os.pipe2(0)
-    cmd += ['xdg-dbus-proxy', f'--fd={pw}'] + args
+    fd = os.memfd_create('sbx-seccomp', 0)
+    with open(fd, 'wb', closefd = False) as file: f.export_bpf(file)
+    os.lseek(fd, 0, os.SEEK_SET)
+    self.seccomp_bpf = os.pread(fd, os.fstat(fd).st_size, 0) # For sbx enter
+    self.cmd_args.extend(('--seccomp', f'{fd}'))
+
+
+  def setup_x11(self):
+    if not self.x11: return
+
+    display = os.environ.get('DISPLAY')
+    if not display: raise SBError('"x11" requires DISPLAY')
+
+    # Host based access, e.g. "SI:localuser", bypasses the cookie and, with the
+    # host's network, the proxy
+    if self.x11 == 'untrusted' or self.net == 'host':
+      try: lines = subprocess.run(
+          ['xhost'], capture_output = True, text = True).stdout.splitlines()
+      except OSError: lines = []
+
+      if lines and ('disabled' in lines[0] or 1 < len(lines)):
+        print('WARNING: X server grants access without a cookie, X11 '
+              'isolation is not enforced.  See "xhost".', file = sys.stderr)
+
+    if self.x11 == 'filtered': return self.setup_x11_proxy(display)
+
+    host, _, num = display.partition(':')
+    if host in ('', 'unix'):
+      sock = f'/tmp/.X11-unix/X{num.split('.')[0]}'
+      self.cmd_args.extend(('--ro-bind-try', sock, sock))
+
+    # Generate a new cookie rather than exposing the host's
+    with tempfile.TemporaryDirectory(dir = self.runtime_dir) as dir:
+      path = f'{dir}/Xauthority'
+      open(path, 'wb').close() # Avoid xauth "does not exist" message
+      try:
+        out = subprocess.run(['xauth', '-v', '-f', path, 'generate', display,
+                              '.', self.x11, 'timeout', '0'], check = True,
+                             stdout = subprocess.PIPE, text = True).stdout
+      except (OSError, subprocess.CalledProcessError) as e:
+        raise SBError(f'Failed to generate X11 cookie: {e}')
+
+      with open(path, 'rb') as f: cookie = f.read()
+
+    # Save ID so the cookie can be revoked on exit
+    for line in out.splitlines():
+      if line.startswith('authorization id is '):
+        self.x11_auth_id = int(line.split()[-1])
+
+    # Wildcard address family so the cookie matches any hostname
+    cookie = b'\xff\xff' + cookie[2:]
+
+    path = f'{self.runtime_dir}/Xauthority'
+    self.cmd_args.extend((
+      '--ro-bind-data', f'{fork_and_write(cookie)}', path,
+      '--setenv', 'XAUTHORITY', path, '--setenv', 'DISPLAY', display))
+
+
+  def setup_x11_proxy(self, display):
+    # A display number unused on the host, so clients reach the proxy rather
+    # than the X server's abstract socket
+    num  = next(n for n in range(64, 256) if not display_in_use(n))
+    dir  = f'{self.runtime_dir}/sbx/{self.args.name}'
+    sock = f'{dir}/X11-{os.getpid()}'
+    os.makedirs(dir, mode = 0o700, exist_ok = True)
+
+    self.start_helper('sbx-x11', [display, sock, f'--exit-fd={self.sync_r}'],
+                      f'{dir}/x11.log', [self.sync_r])
+    self.cmd_args.extend(('--bind', sock, f'/tmp/.X11-unix/X{num}',
+                          '--setenv', 'DISPLAY', f':{num}'))
+
+
+  def watch_sandbox(self):
+    # bwrap holds --sync-fd open until every process in the sandbox has
+    # exited, even if they close it, which may be after sbx.  Then revoke the
+    # X11 cookie, release the portal lock and remove sbx enter's state.  The X11
+    # proxy also watches it.
+    os.set_inheritable(self.sync_w, True)
+    self.cmd_args.extend(('--sync-fd', f'{self.sync_w}'))
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    if os.fork() == 0: # Inherits the portal lock
+      os.setsid()
+      os.close(self.sync_w)
+      os.read(self.sync_r, 1) # EOF
+      self.revoke_x11()
+      shutil.rmtree(self.state, ignore_errors = True)
+      os._exit(0)
+
+
+  def save_state(self):
+    '''The sandbox's environment and seccomp filter, for sbx enter.'''
+    env, args = dict(os.environ), iter(self.cmd_args)
+    for arg in args:
+      if arg == '--clearenv': env.clear()
+      elif arg == '--setenv': env.update([(next(args), next(args))])
+      elif arg == '--unsetenv': env.pop(next(args), None)
+
+    os.makedirs(self.state, mode = 0o700, exist_ok = True)
+    with open(f'{self.state}/env.json', 'w') as f: json.dump(env, f)
+    with open(f'{self.state}/seccomp.bpf', 'wb') as f: f.write(self.seccomp_bpf)
+
+
+  def revoke_x11(self):
+    if self.x11_auth_id is None: return
+
+    x11  = ctypes.CDLL('libX11.so.6')
+    xext = ctypes.CDLL('libXext.so.6')
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    xext.XSecurityRevokeAuthorization.argtypes = [
+      ctypes.c_void_p, ctypes.c_ulong]
+
+    # Xlib's default error handler exits the process
+    errors  = []
+    handler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)(
+      lambda dpy, event: errors.append(event) or 0)
+    x11.XSetErrorHandler(handler)
+
+    dpy = x11.XOpenDisplay(None)
+    if dpy:
+      xext.XSecurityRevokeAuthorization(dpy, self.x11_auth_id)
+      x11.XSync(dpy, 0) # Errors are asynchronous
+      x11.XCloseDisplay(dpy)
+
+    if not dpy or errors:
+      print('WARNING: Failed to revoke X11 cookie', file = sys.stderr)
+
+
+  def setup_net(self):
+    self.net = self.net or 'isolated'
+    if self.net == 'host': return
+    self.cmd_args.append('--unshare-net')
+    if self.net == 'none': return
+    self.allow_proxies()
+
+    # bwrap waits on --block-fd until start_net() has configured the network
+    self.net_info, info_w   = os.pipe()
+    block_r, self.net_block = os.pipe()
+    self.net_fds = (info_w, block_r)
+    for fd in self.net_fds: os.set_inheritable(fd, True)
+    self.cmd_args.extend(('--info-fd', f'{info_w}', '--block-fd', f'{block_r}'))
+
+    # DNS via pasta, the host's resolver may be on a blocked network
+    try:
+      with open('/etc/resolv.conf') as f:
+        conf = ''.join(line for line in f if not line.startswith('nameserver'))
+    except OSError: conf = ''
+    conf += f'nameserver {DNS_FORWARD}\n'
+    self.cmd_args.extend(
+      ('--ro-bind-data', f'{fork_and_write(conf)}', '/etc/resolv.conf'))
+
+
+  def allow_proxies(self):
+    values = {os.environ.get(var) for name in PROXY_VARS
+              for var in (name, name.upper())} - {None, ''}
+
+    for value in values:
+      try:
+        url = urllib.parse.urlsplit(
+          value if '://' in value else f'http://{value}')
+        if not url.hostname or not url.port: raise ValueError('no port')
+        addrs = socket.getaddrinfo(url.hostname, url.port,
+                                   type = socket.SOCK_STREAM)
+      except (ValueError, OSError) as e:
+        print(f'WARNING: Not allowing proxy "{value}": {e}', file = sys.stderr)
+        continue
+
+      for *_, (addr, *_) in addrs:
+        addr = ipaddress.ip_address(addr)
+        # Only pasta's forwards reach the host's loopback
+        if addr.is_loopback: self.host_ports.add(url.port)
+        else: self.allow_net.add((ipaddress.ip_network(addr), url.port))
+
+
+  def net_rules(self):
+    # Policy rules take precedence over routes, which pasta copies from the host
+    out = subprocess.run(['ip', '-j', 'addr', 'show', 'scope', 'global'],
+                         capture_output = True, text = True,
+                         check = True).stdout
+    host = tuple(a['local'] for i in json.loads(out) for a in i['addr_info']
+                 if 'local' in a) # Excluded addresses are empty
+
+    rules = {4: '', 6: ''}
+    def add(pref, action, net, port = None):
+      net   = ipaddress.ip_network(net)
+      match = f' ipproto tcp dport {port}' if port else ''
+      rules[net.version] += f'rule add to {net}{match} pref {pref} {action}\n'
+
+    # The host first, allow-net cannot unblock it
+    for net in host: add(50, 'prohibit', net)
+    for net, port in self.allow_net: add(100, 'lookup main', net, port)
+    for net in BLOCKED_NETS: add(200, 'prohibit', net)
+
+    return rules
+
+
+  def start_net(self):
+    for fd in self.net_fds: os.close(fd)
+    with open(self.net_info) as f: info = f.read()
+    if not info: return # bwrap failed and reports why
+    pid   = str(json.loads(info)['child-pid'])
+    ports = ','.join(map(str, sorted(self.host_ports))) or 'none'
+
+    try:
+      # The sandbox runs in a user namespace nested in the network's owner
+      with open(f'/proc/{pid}/ns/net') as net:
+        owner = fcntl.ioctl(net, NS_GET_USERNS)
+      userns = f'/proc/{os.getpid()}/fd/{owner}'
+
+      subprocess.run(
+        ['pasta', '--config-net', '--quiet', '--userns', userns,
+         '--map-host-loopback', 'none', '--map-guest-addr', 'none',
+         '--dns-forward', DNS_FORWARD, '-t', 'none', '-u', 'none', '-T', ports,
+         '-U', 'none', pid], check = True)
+
+      for version, rules in self.net_rules().items():
+        subprocess.run(
+          ['nsenter', f'--user={userns}', f'--net=/proc/{pid}/ns/net',
+           '--preserve-credentials', '--keep-caps', 'ip', f'-{version}',
+           '-batch', '-'], input = rules, text = True, check = True)
+
+      os.close(owner)
+
+    except (OSError, subprocess.CalledProcessError) as e:
+      os.kill(int(pid), signal.SIGKILL) # Never run partially configured
+      raise SBError(f'Failed to set up network: {e}')
+
+    os.write(self.net_block, b'x')
+    os.close(self.net_block)
+
+
+  def start_helper(self, name, args, log, keep = ()):
+    '''Start a program from sbx's directory and wait until it is ready.'''
+    pr, pw = os.pipe()
+    cmd = [os.path.dirname(os.path.realpath(__file__)) + '/' + name] + args + \
+      [f'--ready-fd={pw}'] + (['--verbose'] if self.args.verbose else [])
 
     if os.fork() == 0:
-      os.close(pr)
-      os.execlp(cmd[0], *cmd)
+      try:
+        # Detach from the terminal and drop other inherited fds, e.g. locks
+        os.setsid()
+        null = os.open('/dev/null', os.O_RDWR)
+        out  = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.dup2(null, 0)
+        os.dup2(out, 1)
+        os.dup2(out, 2)
+
+        keep = {pw, *keep}
+        for fd in map(int, os.listdir('/proc/self/fd')):
+          if 2 < fd and fd not in keep:
+            try: os.close(fd)
+            except OSError: pass
+        for fd in keep: os.set_inheritable(fd, True)
+
+        os.execv(cmd[0], cmd)
+
+      except OSError as e: print(f'Failed to run {cmd[0]}: {e}', flush = True)
+      finally: os._exit(1)
 
     os.close(pw)
-    if os.read(pr, 1) != b'x': # wait for xdg-dbus-proxy to be ready
-      raise SBError('Failed to start xdg-dbus-proxy')
+    ready = os.read(pr, 1) == b'x'
+    os.close(pr)
 
-    self.cmd_args.extend(('--sync-fd', f'{pr}'))
+    if not ready: raise SBError(f'Failed to start {name}, see "{log}"')
+
+
+  def setup_portal(self):
+    if not (self.portals or self.dbus_forwards): return
+
+    app_id = os.environ['APP_NAME']
+    dir    = f'{self.runtime_dir}/sbx/{self.args.name}'
+    os.makedirs(dir, mode = 0o700, exist_ok = True)
+
+    # Held for the life of the sandbox, the service exits when none are held.
+    # See watch_sandbox().
+    self.portal_lock = open(f'{dir}/lock', 'a')
+    fcntl.flock(self.portal_lock, fcntl.LOCK_SH)
+
+    # Runs of the same sandbox share one service
+    with open(f'{dir}/start', 'a') as start:
+      fcntl.flock(start, fcntl.LOCK_EX)
+      with socket.socket(socket.AF_UNIX) as s:
+        try: s.connect(f'{dir}/bus')
+        except OSError:
+          self.start_helper(
+            'sbx-portal', [dir, app_id] +
+            [f'--portal={p}' for p in self.portals] +
+            [f'--forward={name}' for name in self.dbus_forwards],
+            f'{dir}/portal.log')
+
+    bus = f'{self.runtime_dir}/bus'
+    self.cmd_args.extend((
+      '--bind', f'{dir}/bus', bus,
+      '--setenv', 'DBUS_SESSION_BUS_ADDRESS', f'unix:path={bus}'))
+
+    if 'file-chooser' in self.portals:
+      self.cmd_args.extend((
+        '--bind-try', f'{self.runtime_dir}/doc/by-app/{app_id}',
+        f'{self.runtime_dir}/doc'))
 
 
   def run(self):
@@ -461,29 +811,31 @@ class SBX:
     os.environ['SANDBOX_CMD'] = shlex.join(exp_command)
     os.environ['SANDBOX_EXE'] = exp_command[0]
 
+    # Found by sbx ps and sbx enter in bwrap's environment
+    os.environ['SBX_ROOT_PID'] = str(os.getpid())
+    self.state = f'{self.runtime_dir}/sbx/{self.args.name}/{os.getpid()}'
+
     # Apply rules
     self.apply_rule(self.config.get('use', []))
-    self.setup_dbus_proxy()
+    self.setup_seccomp()
+    self.sync_r, self.sync_w = os.pipe() # See watch_sandbox()
+    self.setup_portal()
+    self.setup_x11() # Last, so errors above don't leave a cookie unrevoked
+    self.watch_sandbox()
+    self.setup_net() # After watch_sandbox()'s fork, which would hold the pipes
 
     # Die with parent
     if self.die_with_parent: self.cmd_args.append('--die-with-parent')
-
-    # Create bwrapinfo.json
-    info_path = f'{self.runtime_dir}/.flatpak/{self.id}/bwrapinfo.json'
-    os.makedirs(os.path.dirname(info_path), exist_ok = True)
-    info_fd = open(info_path, 'w')
-    fcntl.fcntl(info_fd, fcntl.F_SETFD, 0)
-    self.cmd_args += ['--info-fd', f'{info_fd.fileno()}']
 
     # Build command (wrap in login shell so ~/.profile is sourced)
     cmd = ['bwrap'] + self.cmd_args + ['bash', '-lc', shlex.join(exp_command)]
     self.log('@' + shlex.join(cmd))
 
     # Execute
+    self.save_state()
     child = os.fork()
-    if child == 0:
-      os.environ['SBX_ROOT_PID'] = str(os.getpid())
-      os.execvp(cmd[0], cmd)
+    if child == 0: os.execvp(cmd[0], cmd)
+    if self.net == 'isolated': self.start_net()
     _, status = os.waitpid(child, 0)
     exit_code = os.waitstatus_to_exitcode(status)
 
@@ -607,7 +959,8 @@ class SBX:
       else: print(rule)
 
 
-  def ps(self):
+  def running(self):
+    '''Running sandboxes, as (name, PID of their init process).'''
     # Dictionary to group processes by their PID namespace inode
     ns_groups = defaultdict(list)
     our_ns_inode = get_pid_ns()
@@ -633,7 +986,7 @@ class SBX:
             if   var.startswith('SANDBOX='):      name  = var[8:]
             elif var.startswith('SBX_ROOT_PID='): valid = True
 
-        if valid is None: continue
+        if not valid: continue
 
         # Get the PID namespace identifier
         ns_inode = get_pid_ns(pid)
@@ -657,10 +1010,14 @@ class SBX:
       procs.sort(key = lambda x: x[1])
       entries.append((procs[0][2], procs[0][0]))
 
-    width = max((len(str(p)) for _, p in entries), default = 4)
+    return sorted(entries)
+
+
+  def ps(self):
+    entries = self.running()
+    width   = max((len(str(p)) for _, p in entries), default = 4)
     print(f'{"PID":<{width}} SANDBOX')
-    for name, pid in sorted(entries):
-      print(f'{pid:<{width}} {name}')
+    for name, pid in entries: print(f'{pid:<{width}} {name}')
 
 
   def delete(self):
@@ -728,31 +1085,65 @@ class SBX:
 
 
   def enter(self):
-    tpid = str(self.args.pid)
-    stat = os.stat(f'/proc/{tpid}')
-    tuid = str(stat.st_uid)
-    tgid = str(stat.st_gid)
-    tcwd = os.readlink(f'/proc/{tpid}/cwd')
-    cmd  = []
+    '''Start a login shell in a running sandbox, restricted like the sandbox's
+    processes.  As the owner of its user namespace, no privileges are needed.'''
+    target  = self.args.target
+    running = [(n, p) for n, p in self.running()
+               if target in (n, str(p))]
+    if not running: raise SBError(f'No running sandbox "{target}"')
+    if 1 < len(running):
+      raise SBError(f'Several instances of "{target}" are running, give a PID '
+                    'from "sbx ps"')
+    name, init = running[0]
 
-    if os.getuid():
-      if not shutil.which('sudo'):
-        raise SBError('"sudo" not found on PATH')
+    with open(f'/proc/{init}/environ') as f:
+      env = dict(v.split('=', 1) for v in f.read().split('\0') if '=' in v)
+    state = f'{self.runtime_dir}/sbx/{name}/{env['SBX_ROOT_PID']}'
+    try:
+      with open(f'{state}/env.json') as f: env = json.load(f)
+      with open(f'{state}/seccomp.bpf', 'rb') as f: bpf = f.read()
+    except OSError as e: raise SBError(f'Cannot enter "{name}": {e}')
 
-      cmd += ['sudo']
+    # The sandbox command's working directory, or the root
+    with open(f'/proc/{init}/task/{init}/children') as f: children = f.read()
+    cwd = os.open(f'/proc/{children.split()[0]}/cwd' if children else
+                  f'/proc/{init}/root', os.O_RDONLY | os.O_DIRECTORY)
 
-    if not shutil.which('nsenter'):
-      raise SBError('"nsenter" not found on PATH')
+    # Open all before joining any, the mount namespace changes /proc
+    ns = {kind: os.open(f'/proc/{init}/ns/{kind}', os.O_RDONLY)
+          for kind in ('user', 'ipc', 'uts', 'net', 'pid', 'mnt')}
+    owner = fcntl.ioctl(ns['mnt'], NS_GET_USERNS) # bwrap may nest 'user' in it
 
-    cmd += ['nsenter', '-t', tpid, '-e']
+    # Skip namespaces already joined, e.g. the host's network
+    ino  = lambda fd: os.fstat(fd).st_ino
+    join = [(ns[kind], flag) for kind, flag in (
+      ('ipc', os.CLONE_NEWIPC), ('uts', os.CLONE_NEWUTS),
+      ('net', os.CLONE_NEWNET), ('pid', os.CLONE_NEWPID),
+      ('mnt', os.CLONE_NEWNS))
+            if ino(ns[kind]) != os.stat(f'/proc/self/ns/{kind}').st_ino]
+    if ino(ns['user']) != ino(owner): join.append((ns['user'],
+                                                   os.CLONE_NEWUSER))
 
-    if self.args.root:
-      cmd += ['--mount', '--uts', '--ipc', '--net', '--pid']
-    else: cmd += ['-a', '-S', tuid, '-G', tgid]
+    os.setns(owner, os.CLONE_NEWUSER) # Grants the rights to join the others
+    for fd, flag in join: os.setns(fd, flag)
 
-    cmd += ['/bin/bash', '-c', f'cd "{tcwd}" && exec /bin/bash -l']
+    child = os.fork() # Joins the PID namespace
+    if child == 0:
+      try:
+        os.fchdir(cwd)
+        for cap in range(64): libc.prctl(PR_CAPBSET_DROP, cap, 0, 0, 0)
+        prog = SockFprog(len(bpf) // 8, bpf)
+        if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) or \
+           libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(prog),
+                      0, 0):
+          raise OSError(ctypes.get_errno(), 'Failed to apply seccomp filter')
+        os.execve('/bin/bash', ['bash', '-l'], env)
 
-    os.execvp(cmd[0], cmd)
+      except OSError as e: print(f'ERROR: {e}', file = sys.stderr)
+      finally: os._exit(1)
+
+    _, status = os.waitpid(child, 0)
+    sys.exit(os.waitstatus_to_exitcode(status))
 
 
   def exec(self):
@@ -824,10 +1215,9 @@ tpl_parser.add_argument(
   '--force', '-f', action = 'store_true',
   help = 'overwrite the template if it already exists')
 
-ent_parser = subs.add_parser('enter', help = 'enter a running container')
-ent_parser.add_argument('pid', type = int, help = 'Process ID')
-ent_parser.add_argument(
-  '--root', '-r', action = 'store_true', help = 'enter as root user')
+ent_parser = subs.add_parser('enter', help = 'enter a running sandbox')
+ent_parser.add_argument('target', help = 'name of the sandbox, or a PID ' +
+                        'from "sbx ps" if several instances are running')
 
 subs.add_parser('help', help = 'show this help message and exit')
 

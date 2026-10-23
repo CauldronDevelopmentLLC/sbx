@@ -16,10 +16,39 @@ Default blacklist: `$HOME`, `$HOME/.ssh`, `$HOME/.gnupg`, `$HOME/.aws`,
 `$HOME/.config`, `$HOME/.local`, `$HOME/Documents`, `$HOME/Desktop`,
 `$HOME/Downloads`, `/`, `/etc`, `/root`.
 
-### Per-sandbox network policy
-Domain allowlist for outbound network. bwrap can't filter by domain; needs a
-proxy in the parent namespace that the sandbox is routed through. Look at
-how Docker's sbx does this.
+### Network domain allowlist
+Restrict a sandbox's internet access to listed domains, via a proxy.
+
+### Wayland socket filtering
+Create a `security-context-v1` socket per sandbox so wlroots compositors hide
+privileged protocols (`virtual-keyboard`, `wlr-screencopy`,
+`wlr-data-control`, `foreign-toplevel`).  Needs a small Wayland client.
+
+### sbx-x11 follow-ups
+Performance, measured with x11perf on Intel Iris Xe:
+
+| Test (per second)   | Direct  | sbx-x11 | Two chained |
+|---------------------|---------|---------|-------------|
+| PutImage 500x500    | 9,390   | 2,570   |             |
+| ShmPutImage 500x500 | 13,900  | 3,630   | 3,090       |
+| GetProperty         |         | 36,200  | 21,900      |
+| NoOperation         |         | 3.2 M   |             |
+
+x11perf syncs each image with a 1 pixel GetImage, so these are round trip
+bound.  Profiling shows the proxy mostly idle in epoll, so the cost is wake
+up latency per hop, ~18 µs per round trip, ~60 µs when the server is busy
+between requests.  Open: the direct numbers were taken on the host, outside
+any sandbox, and a first hop appears to cost ~190 µs.  Compare with
+`x11-trusted` in a sandbox to separate proxy and sandbox costs.  A C or Rust
+rewrite would cut processing, not wake ups.
+
+Screen contents under a sandbox window, unpainted (background None) or
+overlapped by another window, are readable without a compositing manager.
+Fix: track which drawables are windows and deny reading windows into
+readable drawables, e.g. `GetImage`, `CopyArea` to a pixmap, RENDER sources.
+
+Other: check `PointerRoot` focus.  `NV-GLX` is opaque and passed unfiltered.  Offline tests:
+`tests/sbx-x11`.
 
 ### readonly-overlay action
 Bind a host path read-only with a writable tmpfs upper layer. Writes go to
