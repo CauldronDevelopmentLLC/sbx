@@ -22,7 +22,14 @@ Restrict a sandbox's internet access to listed domains, via a proxy.
 ### Wayland socket filtering
 Create a `security-context-v1` socket per sandbox so wlroots compositors hide
 privileged protocols (`virtual-keyboard`, `wlr-screencopy`,
-`wlr-data-control`, `foreign-toplevel`).  Needs a small Wayland client.
+`wlr-data-control`, `foreign-toplevel`).  Needs a small Wayland client.  With
+a nested X server, e.g. Xwayland per sandbox, X11 applications would be
+isolated by construction rather than by sbx-x11's filtering.
+
+### sbx-x11 extension resources
+Requests of allowed extensions are checked against known opcodes, but not all
+check that the resources they change are the sandbox's, e.g. RENDER
+FreePicture, XFIXES DestroyRegion, SYNC SetCounter.
 
 ### sbx-x11 follow-ups
 Performance, measured with x11perf on Intel Iris Xe:

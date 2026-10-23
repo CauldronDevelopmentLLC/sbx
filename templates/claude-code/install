@@ -1,0 +1,22 @@
+#!/bin/bash
+# Installs or updates Claude Code in $SBX_APPS/claude-code
+app=claude-code
+. "$SBX_LIB/templates/app.sh"
+
+base=https://downloads.claude.ai/claude-code-releases
+platform=linux-$(arch x64 arm64)
+version=$(curl -fsS --proto =https "$base/latest")
+[[ $version =~ ^[0-9]+(\.[0-9]+)+$ ]] || version= # E.g. an error page
+
+check "$version"
+
+sha=$(curl -fsS --proto =https "$base/$version/manifest.json" |
+  python3 -c 'import json, sys
+print(json.load(sys.stdin)["platforms"][sys.argv[1]]["checksum"])' "$platform")
+mkdir "$tmp/unpacked"
+fetch "$base/$version/$platform/claude" "$tmp/unpacked/claude"
+
+log "Verifying"
+echo "$sha  $tmp/unpacked/claude" | sha256sum -c --quiet
+chmod 755 "$tmp/unpacked/claude"
+activate "$version" "$tmp/unpacked"

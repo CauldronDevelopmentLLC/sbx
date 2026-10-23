@@ -57,17 +57,27 @@ GRAB_KEY, GRAB_SERVER, WARP_POINTER, SET_INPUT_FOCUS = 33, 36, 41, 42
 GET_INPUT_FOCUS, QUERY_KEYMAP = 43, 44
 CREATE_GC, CHANGE_GC, COPY_AREA, COPY_PLANE, GET_IMAGE = 55, 56, 62, 63, 73
 CREATE_CURSOR, QUERY_EXTENSION, LIST_EXTENSIONS, NO_OPERATION = 93, 98, 99, 127
-GET_KEYBOARD_MAPPING, KILL_CLIENT = 101, 113
-# On the window at offset 4, e.g. DestroyWindow, MapWindow, ConfigureWindow,
-# GrabButton, ClearArea, RotateProperties
-WINDOW_WRITES = (4, 5, 6, 8, 9, 10, 11, 12, 13, 28, 61, 114)
+GET_KEYBOARD_MAPPING, KILL_CLIENT, LIST_PROPERTIES = 101, 113, 21
+COPY_GC, COPY_COLORMAP_AND_FREE = 57, 80
+# Every core request is passed, checked or denied, so unknown ones are denied.
+# Passed, e.g. QueryTree, InternAtom, QueryPointer, OpenFont, CreatePixmap,
+# AllocColor, Bell, NoOperation
+CORE_ALLOWED = (
+  3, 14, 15, 16, 17, 23, 27, 29, 30, 32, 34, 35, 37, 38, 39, 40, 43, 45, 47,
+  48, 49, 50, 52, 53, 78, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 94,
+  97, 101, 103, 104, 106, 108, 110, 112, 115, 117, 119, NO_OPERATION)
+# On a resource at offset 4 which must be the sandbox's, e.g. DestroyWindow,
+# MapWindow, ConfigureWindow, GrabButton, ClearArea, RotateProperties,
+# CloseFont, FreePixmap, SetDashes, FreeGC, FreeColormap, FreeCursor
+RESOURCE_WRITES = (4, 5, 6, 8, 9, 10, 11, 12, 13, 28, 46, 54, 58, 59, 60, 61,
+                   79, 95, 96, 114)
 DRAWS = (64, 65, 66, 67, 68, 69, 70, 71, 72, 74, 75, 76, 77) # E.g. PutImage
 # Server wide, e.g. SetFontPath, ChangeKeyboardMapping, ChangeHosts
 GLOBAL_WRITES = (51, 100, 102, 105, 107, 109, 111, 116, 118)
 
 # Events
 KEY_PRESS, KEY_RELEASE, BUTTON_PRESS, BUTTON_RELEASE = 2, 3, 4, 5
-KEYMAP_NOTIFY, UNMAP_NOTIFY, SELECTION_REQUEST = 11, 18, 30
+KEYMAP_NOTIFY, UNMAP_NOTIFY, PROPERTY_NOTIFY, SELECTION_REQUEST = 11, 18, 28, 30
 SELECTION_NOTIFY, CLIENT_MESSAGE, MAPPING_NOTIFY, GENERIC_EVENT = 31, 33, 34, 35
 SYNTHETIC = 0x80 # Sent with SendEvent
 XI_KEY_PRESS, XI_KEY_RELEASE, XI_BUTTON_PRESS, XI_BUTTON_RELEASE = 2, 3, 4, 5
@@ -100,6 +110,16 @@ PUBLIC_PROPERTIES = {
   '_NET_WM_DESKTOP', '_NET_FRAME_EXTENTS', '_MOTIF_WM_HINTS',
   '_NET_SUPPORTING_WM_CHECK'}
 PUBLIC_PREFIXES = ('Xdnd', '_XEMBED', '_XSETTINGS')
+# Readable on the root window, others are hidden
+ROOT_PROPERTIES = {
+  'RESOURCE_MANAGER', '_XKB_RULES_NAMES', 'XIM_SERVERS', 'AT_SPI_BUS',
+  '_ICC_PROFILE', 'GDK_VISUALS', '_XROOTPMAP_ID', 'ESETROOT_PMAP_ID',
+  '_NET_SUPPORTED', '_NET_SUPPORTING_WM_CHECK', '_NET_WORKAREA',
+  '_NET_CURRENT_DESKTOP', '_NET_NUMBER_OF_DESKTOPS', '_NET_DESKTOP_GEOMETRY',
+  '_NET_DESKTOP_VIEWPORT'}
+# Readable on the root window, listing only the sandbox's windows
+ROOT_WINDOW_LISTS = {
+  '_NET_ACTIVE_WINDOW', '_NET_CLIENT_LIST', '_NET_CLIENT_LIST_STACKING'}
 KEY_EVENT_MASK  = 1 << 0 | 1 << 1 | 1 << 14 # KeyPress, KeyRelease, KeymapState
 XI2_KEY_EVENTS  = (2, 3, 13, 14) # KeyPress, KeyRelease, RawKeyPress, RawKeyRel.
 XI1_KEY_EVENTS  = {1, 2, 10, 13} # DeviceKeyPress, Release, State, KeyState
@@ -107,6 +127,39 @@ XKB_KEY_EVENTS  = {2: 28, 9: 9, 10: 9} # State, ActionMessage, AccessX: keycode
 
 
 def forbidden(*minors): return dict.fromkeys(minors, 'forbid')
+
+
+# Minor opcodes of the allowed extensions, from xcb-proto, others are denied.
+# GLX's and NV-GLX's are not limited, GLX's checks are by drawable.
+EXT_MINORS = {
+  'BIG-REQUESTS': '0',
+  'Composite': '0-8',
+  'DAMAGE': '0-4',
+  'DOUBLE-BUFFER': '0-7',
+  'DPMS': '0-8',
+  'DRI3': '0-11',
+  'Generic Event Extension': '0',
+  'MIT-SCREEN-SAVER': '0-5',
+  'MIT-SHM': '0-7',
+  'Present': '0-5',
+  'RANDR': '0 2 4-46',
+  'RENDER': '0-2 4-8 10-13 17-20 22-36',
+  'SHAPE': '0-8',
+  'SYNC': '0-19',
+  'XC-MISC': '0-2',
+  'XFIXES': '0-34',
+  'XFree86-VidModeExtension': '0-20',
+  'XINERAMA': '0-5',
+  'XInputExtension': '1-61',
+  'XKEYBOARD': '0-1 3-19 21-25', # 19: GetGeometry, missing in xcb-proto
+  'XVideo': '0-19',
+}
+
+
+def minors(spec):
+  '''The opcodes in e.g. "0 2 4-46".'''
+  return {op for part in spec.split() for op in range(
+    int(part.split('-')[0]), int(part.split('-')[-1]) + 1)}
 
 
 # Extension requests to filter, by minor opcode.  A check with a length needs
@@ -127,10 +180,10 @@ EXT_FILTERS = {
   'RANDR': forbidden(2, 7, 12, 13, 14, 16, 17, 18, 19, 21, 24, 26, 29, 30, 34,
                      35, 38, 39, 40, 43, 44, 45, 46), # Screen config, leases
   'RENDER': {4: 'render_create_picture', 5: 'render_change_picture',
-             8: 'render_source', 10: 'render_source', 11: 'render_source',
-             12: 'render_source', 13: 'render_source', 23: 'render_source',
-             24: 'render_source', 25: 'render_source', 27: 'render_source'},
-  'SHAPE': {1: 'drawable_8', 2: 'drawables_8_12', 3: 'drawables_8_12',
+             8: 'render_source', 27: 'render_source',
+             **dict.fromkeys((10, 11, 12, 13, 23, 24, 25), # E.g. Trapezoids,
+                             ('render_source', 16))}, # can be big
+  'SHAPE': {1: ('drawable_8', 12), 2: 'drawables_8_12', 3: 'drawables_8_12',
             4: 'drawable_8'},
   # Read only, e.g. the refresh rate for glXGetMscRateOML
   'XFree86-VidModeExtension': forbidden(2, 3, 5, 7, 8, 10, 12, 15, 18),
@@ -310,12 +363,19 @@ class Server:
     return self.names[atom]
 
 
-  def public(self, window, atom):
-    '''Whether the property may be read on another client's window.'''
+  def access(self, window, atom):
+    '''How sandboxed clients may read a property on another client's window:
+    "read", "windows" for a list showing only the sandbox's windows, or None
+    if hidden.'''
     name = self.name(atom)
-    if name == '_NET_WM_NAME': return self.wm_check(window) # The WM's name
-    return name is not None and (name in PUBLIC_PROPERTIES or
-                                 name.startswith(PUBLIC_PREFIXES))
+    if name is None: return
+    if window in self.roots:
+      if name in ROOT_WINDOW_LISTS: return 'windows'
+      return 'read' if name in ROOT_PROPERTIES else None
+    if name == '_NET_WM_NAME': # The WM's name
+      return 'read' if self.wm_check(window) else None
+    if name in PUBLIC_PROPERTIES or name.startswith(PUBLIC_PREFIXES):
+      return 'read'
 
 
   def wm_check(self, window):
@@ -548,16 +608,24 @@ class Client:
       return (check[1], getattr(self, check[0])) if isinstance(check, tuple) \
         else getattr(self, check)
 
-    self.checks = [None] * 256
+    self.checks = [self.deny] * 256
+    for op in CORE_ALLOWED: self.checks[op] = None
     for op, check in CORE_CHECKS.items(): self.checks[op] = get(check)
 
     for op in range(128, 256):
       name = self.server.ops.get(op)
-      if name not in ALLOWED: self.checks[op] = self.deny
-      elif name in EXT_FILTERS:
-        self.checks[op] = [None] * 256
-        for minor, check in EXT_FILTERS[name].items():
-          self.checks[op][minor] = get(check)
+      if name not in ALLOWED: continue
+      if name not in EXT_MINORS and name not in EXT_FILTERS:
+        self.checks[op] = None
+        continue
+
+      table = self.checks[op] = [None] * 256
+      if name in EXT_MINORS:
+        known = minors(EXT_MINORS[name])
+        for minor in range(256):
+          if minor not in known: table[minor] = self.deny
+      for minor, check in EXT_FILTERS.get(name, {}).items():
+        table[minor] = get(check)
 
     events = self.event_checks = [None] * 256
     for code in (KEY_PRESS, KEY_RELEASE, KEYMAP_NOTIFY):
@@ -565,6 +633,7 @@ class Client:
     events[BUTTON_PRESS] = self.button_event
     events[BUTTON_RELEASE] = self.button_release
     events[SELECTION_REQUEST] = self.selection_request
+    events[PROPERTY_NOTIFY] = self.property_notify
     events[CLIENT_MESSAGE | SYNTHETIC] = self.client_message
     events[GENERIC_EVENT] = self.generic_event
 
@@ -612,20 +681,21 @@ class Client:
 
       if n - i < size: break
       if start < i: out.append(data[start:i])
-      req = bytes(data[i:i + size])
+      orig = req = bytes(data[i:i + size])
       i = start = i + size
       self.seq = (self.seq + 1) & 0xffff
 
-      # Normalize, so offsets are as checks expect
+      # Normalize, so offsets are as checks expect.  The length is only right
+      # if it fits, checks of requests which can be that big do not use it.
       if big:
-        if length - 1 > 0xffff:
-          out.append(self.replace(('error', BAD_LENGTH), op, minor))
-          continue
-        req = req[:2] + struct.pack(o + 'H', length - 1) + req[8:]
+        req = req[:2] + struct.pack(o + 'H', min(length - 1, 0xffff)) + req[8:]
 
       result = check(req)
-      if result is None: out.append(req)
-      elif isinstance(result, bytes): out.append(result)
+      if result is None: out.append(orig)
+      elif isinstance(result, bytes):
+        if big and length - 1 > 0xffff: # A rewrite cannot be that long
+          result = self.replace(('error', BAD_LENGTH), op, minor)
+        out.append(result)
       else: out.append(self.replace(result, op, minor))
 
     if start < i: out.append(data[start:i])
@@ -701,6 +771,25 @@ class Client:
     if msg[0] != 1: return msg
 
     if kind == 'query' and data not in ALLOWED: msg[8:12] = bytes(4)
+
+    if kind == 'windows': # GetProperty of a window list, data is its name
+      # Unless all of a list of 32 bit values, as if it did not exist
+      if msg[1] != 32 or self.u32(msg, 12):
+        return struct.pack(self.o + 'BBHIIII12x', 1, 0, seq, 0, 0, 0, 0)
+
+      values = [v for v in struct.unpack_from(
+        self.o + f'{self.u32(msg, 16)}I', msg, 32) if self.proxy.sandbox(v)]
+      if not values and data == '_NET_ACTIVE_WINDOW': values = [0]
+      msg = struct.pack(self.o + 'BBHI4sII12x', 1, 32, seq, len(values),
+                        bytes(msg[8:12]), 0, len(values)) + \
+        struct.pack(self.o + f'{len(values)}I', *values)
+
+    if kind == 'properties': # ListProperties, data is the window
+      atoms = [a for a in struct.unpack_from(
+        self.o + f'{self.u16(msg, 8)}I', msg, 32)
+               if self.server.access(data, a)]
+      msg = struct.pack(self.o + 'BxHIH22x', 1, seq, len(atoms), len(atoms)) + \
+        struct.pack(self.o + f'{len(atoms)}I', *atoms)
 
     if kind == 'list':
       names, i = [], 32
@@ -816,7 +905,9 @@ class Client:
 
 
   def create_gc(self, req): return self.edit_values(req, 12, self.gc_values)
-  def change_gc(self, req): return self.edit_values(req, 8, self.gc_values)
+  def change_gc(self, req):
+    if not self.own_at(req, 4): return ('drop',)
+    return self.edit_values(req, 8, self.gc_values)
 
 
   def send_event(self, req):
@@ -861,14 +952,27 @@ class Client:
   def get_property(self, req):
     window, prop = struct.unpack_from(self.o + 'II', req, 4)
     if self.proxy.sandbox(window): return
-    if window in self.server.roots or self.server.public(window, prop):
-      if req[1]: return req[:1] + b'\0' + req[2:] # Without deleting it
-      return
+
+    access = self.server.access(window, prop)
+    if access == 'windows':
+      if self.u32(req, 16): access = None # Parts cannot be filtered
+      else:
+        self.pending.append((self.seq, 'windows', self.server.name(prop)))
+        # All of it, so it can be filtered, also if the client reads parts
+        req = req[:20] + struct.pack(self.o + 'I', 0x10000)
+
+    if access: return req[:1] + b'\0' + req[2:] # Without deleting it
 
     # As if the property did not exist
     if self.verbose: log(f'Hid property {self.server.name(prop)} on {window:x}')
     return ('reply', lambda seq: struct.pack(self.o + 'BBHIIII12x', 1, 0, seq,
                                              0, 0, 0, 0))
+
+
+  def list_properties(self, req): # Lists only those readable, see respond()
+    window = self.u32(req, 4)
+    if not self.proxy.sandbox(window):
+      self.pending.append((self.seq, 'properties', window))
 
 
   def convert_selection(self, req):
@@ -1004,6 +1108,12 @@ class Client:
       self.proxy.focus_until = time.monotonic() + INPUT_TIME
 
 
+  def property_notify(self, msg): # Changes to hidden properties are hidden
+    window, atom = struct.unpack_from(self.o + 'II', msg, 4)
+    if not (self.proxy.sandbox(window) or self.server.access(window, atom)):
+      return b''
+
+
   def selection_request(self, msg): # Another application reads our selection
     requestor, _, target, prop = struct.unpack_from(self.o + '4I', msg, 12)
     self.proxy.allow_write(requestor, prop or target)
@@ -1021,7 +1131,7 @@ CORE_CHECKS = {
   CREATE_WINDOW: 'create_window',
   CHANGE_WINDOW_ATTRIBUTES: 'change_window_attributes',
   REPARENT_WINDOW: 'reparent_window',
-  CHANGE_PROPERTY: 'change_property',
+  CHANGE_PROPERTY: ('change_property', 12), # E.g. big icons
   DELETE_PROPERTY: 'change_property',
   SET_SELECTION_OWNER: 'set_selection_owner',
   SEND_EVENT: 'send_event',
@@ -1043,7 +1153,10 @@ CORE_CHECKS = {
   QUERY_EXTENSION: 'query_extension',
   LIST_EXTENSIONS: 'list_extensions',
   KILL_CLIENT: 'kill_client',
-  **dict.fromkeys(WINDOW_WRITES, 'window_4'),
+  LIST_PROPERTIES: 'list_properties',
+  COPY_GC: 'drawable_8', # The destination GC
+  COPY_COLORMAP_AND_FREE: 'drawable_8', # The source colormap
+  **dict.fromkeys(RESOURCE_WRITES, 'window_4'),
   **dict.fromkeys(DRAWS, ('window_4', 8)), # On the drawable at offset 4
   **dict.fromkeys(GLOBAL_WRITES, 'forbid'),
 }

@@ -66,11 +66,13 @@ into each sandbox made from them:
 use: [browser, private-home, app]
 command: [/opt/brave/brave]
 imports: [$SBX_LIB/global.yml]
-pre-hook: '[ -e "$SBX_APPS/brave/current" ] || "$SBX_LIB/templates/brave/install"'
-update-hook: '"$SBX_LIB/templates/brave/install"'
+pre-hook: >-
+  [ -e "$SBX_APPS/brave-browser/current" ] ||
+  "$SBX_LIB/templates/brave/install" brave-browser
+update-hook: '"$SBX_LIB/templates/brave/install" brave-browser'
 rules:
   app:
-    - bind: {path: $SBX_APPS/brave/current, dst: /opt/brave}
+    - bind: {path: $SBX_APPS/brave-browser/current, dst: /opt/brave}
 ```
 
 Install scripts use the helpers in ``$SBX_LIB/templates/app.sh``.  They must

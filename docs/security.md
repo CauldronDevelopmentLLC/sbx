@@ -55,8 +55,8 @@ Sandboxes never connect to the host's session bus.  With the ``portal`` or
 - ``file-chooser`` - Files are chosen in the host's dialog and only those are
   exposed, via the host's document portal.
 - ``open-uri``     - ``http``, ``https`` and ``mailto`` links open in the
-  host's default application.  Files open only after the user picks an
-  application.  Executables are refused.
+  host's default application, also those opened with ``xdg-open``.  Files
+  open only after the user picks an application.  Executables are refused.
 - ``print``        - Printing via the host's print dialog.  Browsers' own print
   previews need CUPS, see the ``cups`` rule, otherwise use their system
   dialog, e.g. Chrome's Ctrl+Shift+P or Firefox's
@@ -116,12 +116,17 @@ DBE, DRI3 and GLX.  It also:
 - Allows keyboard grabs only while a sandbox window has the focus and drops
   key events while it does not, so a grab cannot capture keys typed
   elsewhere, only swallow them.
-- Allows reading only properties needed for drag and drop, embedding and
-  settings, e.g. ``WM_STATE``, on other clients' windows.  Titles, class,
-  command line, PID and icons are hidden, and data pasted in host
-  applications cannot be read in transit.
-- Blocks changes to other clients' windows: mapping, moving, destroying,
-  reparenting, drawing on them, creating windows inside them, their
+- Allows reading only listed properties of other clients' windows, e.g.
+  ``WM_STATE`` for drag and drop, and of the root window, e.g. the window
+  manager's settings.  Titles, class, command line, PID, icons, workspace
+  names and data pasted in host applications are hidden.  The active window
+  and window lists show only the sandbox's windows.
+- Denies requests it does not know.  Each core request and each request of
+  an allowed extension is passed, checked or denied.  GLX and ``NV-GLX``
+  requests are not listed, GLX is checked by drawable.
+- Blocks changes to other clients' windows and resources: mapping, moving,
+  destroying, reparenting, drawing on them, creating windows inside them,
+  freeing or changing their pixmaps, GCs, fonts, colormaps or cursors, their
   properties, except to answer a paste from the sandbox, and synthetic events
   other than selection, drag and drop and embedding messages.
 - Blocks server wide changes: keyboard and pointer mappings and settings, XKB
@@ -136,8 +141,11 @@ Limits: with ``PointerRoot`` focus, e.g. some focus follows mouse setups, key
 events are not checked.  Without a compositing manager, a client can read
 the screen's contents under its own windows where they are unpainted or
 overlapped.  Vendor extensions such as NVIDIA's ``NV-GLX`` are passed
-unfiltered.  With ``-v``, denials are logged to
-``$XDG_RUNTIME_DIR/sbx/<sandbox>/x11.log``.
+unfiltered.  Whether the user is active stays visible, e.g. through the
+pointer's position.  X11 shares one server between all clients, so filtering
+it can only approach the isolation of Wayland.  With ``-v``, denials and
+hidden properties are logged to ``$XDG_RUNTIME_DIR/sbx/<sandbox>/x11.log``,
+e.g. to find a property an application needs.
 
 The proxy adds latency to every round trip, about 20 µs when idle and more
 when the X server is busy between requests.  Applications which wait for the

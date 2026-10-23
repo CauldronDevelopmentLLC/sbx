@@ -16,7 +16,11 @@ needs no root privileges, daemons or container images.
 See *Install*, then:
 
 ```sh
-# Brave, installed on the first run.  Templates: brave, floorp and vscode.
+# Claude Code with only the current directory, installed on the first run
+sbx create claude -t claude-code
+cd ~/src/project && sbx run claude
+
+# Brave, also e.g. -t brave-origin-nightly or -t floorp
 sbx create brave -t brave
 sbx run brave
 sbx update brave            # Updates the install shared by brave sandboxes
@@ -28,10 +32,6 @@ sbx run code
 # A browser from your distribution, e.g. chromium
 sbx create firefox -r browser -r firefox -r private-home firefox
 sbx run firefox
-
-# A shell for an AI agent with the current directory, install the agent in it
-sbx create agent -r cli -r private-home bash
-cd ~/src/project && sbx run agent
 
 # npm with only the current directory
 sbx create npm -r cli npm
@@ -73,16 +73,16 @@ On Debian, or the equivalent packages on other distributions:
 
     sudo apt-get install -y python3 python3-yaml python3-seccomp python3-gi \
       bubblewrap dbus-daemon xauth passt iproute2 xdg-desktop-portal-gtk \
-      curl gpg unzip xz-utils
+      libglib2.0-bin curl gpg unzip xz-utils
     sudo make install
 
 ``util-linux`` 2.39 or later is needed.  ``make install`` installs ``sbx``,
 ``sbx-portal`` and ``sbx-x11`` in ``/usr/local/bin`` and the default rules,
 ``global.yml``, and templates in ``/usr/local/lib/sbx`` and bash and fish
-completions, or under ``$PREFIX``.  To change the default rules, copy ``global.yml`` to
-``~/.config/sbx/``, which is then used instead.  Install by copying, never
-by linking to a checkout which a sandbox can write.  ``make check`` runs the
-tests.
+completions, or under ``$PREFIX``.  To change the default rules, copy
+``global.yml`` to ``~/.config/sbx/``, which is then used instead.  Install by
+copying, never by linking to a checkout which a sandbox can write.  ``make
+check`` runs the tests.
 
 On X11, see also [X11](docs/security.md#x11) on removing the X server's
 access grant by user.
@@ -108,9 +108,10 @@ be repeated.  Options for the command follow ``--``, e.g.
 
 ``sbx run`` returns the command's exit code, unless the ``post-hook`` fails.
 
-``sbx enter <name>`` starts a login shell in a running sandbox, on the current
-terminal, with the same restrictions as the sandbox's processes.  It needs no
-privileges.  If several instances are running, give a PID from ``sbx ps``.
+``sbx enter <name> [-- <command>...]`` runs a login shell, or the command, in
+a running sandbox, on the current terminal, with the same restrictions as
+the sandbox's processes.  It needs no privileges.  If several instances are
+running, give a PID from ``sbx ps``.
 
 ``sbx update <name>`` runs the sandbox's ``update-hook``, e.g. to update the
 program a template installed.

@@ -1187,7 +1187,9 @@ class SBX:
            libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(prog),
                       0, 0):
           raise OSError(ctypes.get_errno(), 'Failed to apply seccomp filter')
-        os.execve('/bin/bash', ['bash', '-l'], env)
+        # A login shell, or the command run by one as "sbx run" does
+        cmd = ['-c', shlex.join(self.args.command)] if self.args.command else []
+        os.execve('/bin/bash', ['bash', '-l', *cmd], env)
 
       except OSError as e: print(f'ERROR: {e}', file = sys.stderr)
       finally: os._exit(1)
@@ -1279,6 +1281,8 @@ ren_parser.add_argument('new_name', help = 'new name of the sandbox')
 ent_parser = subs.add_parser('enter', help = 'enter a running sandbox')
 ent_parser.add_argument('target', help = 'name of the sandbox, or a PID ' +
                         'from "sbx ps" if several instances are running')
+ent_parser.add_argument('command', nargs = '*', help = 'command and ' +
+                        'arguments to run instead of a login shell, after "--"')
 
 subs.add_parser('help', help = 'show this help message and exit')
 

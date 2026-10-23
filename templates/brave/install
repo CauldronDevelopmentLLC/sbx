@@ -1,33 +1,38 @@
 #!/bin/bash
-# Installs or updates Brave Origin nightly in $SBX_APPS/brave
-app=brave
+# Installs or updates a Brave variant in $SBX_APPS/<variant>, e.g.
+# brave-browser, brave-origin or brave-origin-nightly
+app=${1:-brave-browser}
 . "$SBX_LIB/templates/app.sh"
 
-prefix=brave-origin-nightly-
-suffix=-linux-$(arch amd64 arm64).zip
-url=$(curl -fsS --proto =https \
-  'https://api.github.com/repos/brave/brave-browser/releases?per_page=50' |
+info=$(curl -fsS --proto =https \
+  'https://api.github.com/repos/brave/brave-browser/releases?per_page=100' |
   python3 -c '
-import json, sys
+import json, re, sys
+name = re.compile(re.escape(sys.argv[1]) + r"-([0-9.]+)-linux-" + sys.argv[2] +
+                  r"\.zip")
 for release in json.load(sys.stdin):
   for asset in release["assets"]:
-    name = asset["name"]
-    if name.startswith(sys.argv[1]) and name.endswith(sys.argv[2]):
-      sys.exit(print(asset["browser_download_url"]))
-sys.exit("No Brave Origin nightly release found")' "$prefix" "$suffix")
+    if match := name.fullmatch(asset["name"]):
+      sys.exit(print(match[1], asset["browser_download_url"]))
+sys.exit("No release of " + sys.argv[1] + " found")' \
+  "$app" "$(arch amd64 arm64)")
+read -r version url <<< "$info"
 
-zip=${url##*/}
-version=${zip#"$prefix"}
-version=${version%"$suffix"}
 check "$version"
 
+zip=${url##*/}
 fetch "$url"
 fetch "$url.sha256"
 fetch "$url.sha256.asc"
 
+# Brave's keys for GitHub checksums, from brave.com/signing-keys
+case $app in
+  *-nightly|*-beta) key=checksums-pre-release.asc ;;
+  *) key=checksums-release.asc ;;
+esac
+
 log "Verifying"
-# Brave's key for GitHub pre-release checksums, from brave.com/signing-keys
-gpg --homedir "$tmp" -q --dearmor < "${0%/*}/checksums-key.asc" > "$tmp/key.gpg"
+gpg --homedir "$tmp" -q --dearmor < "${0%/*}/$key" > "$tmp/key.gpg"
 gpgv --homedir "$tmp" -q --keyring "$tmp/key.gpg" "$tmp/$zip.sha256.asc" \
   "$tmp/$zip.sha256"
 (cd "$tmp" && sha256sum -c --quiet "$zip.sha256")

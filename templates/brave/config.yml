@@ -1,13 +1,13 @@
-# Brave Origin nightly.  Sandboxes made from this template share one
-# read-only install, installed on the first run and updated with "sbx update".
+# Brave.  Sandboxes made from this template share one read-only install,
+# installed on the first run and updated with "sbx update".
 use: [browser, private-home, app]
 command: [/opt/brave/brave]
 imports: [$SBX_LIB/global.yml]
 pre-hook: >-
-  [ -e "$SBX_APPS/brave/current" ] ||
-  "$SBX_LIB/templates/brave/install"
-update-hook: '"$SBX_LIB/templates/brave/install"'
+  [ -e "$SBX_APPS/brave-browser/current" ] ||
+  "$SBX_LIB/templates/brave/install" brave-browser
+update-hook: '"$SBX_LIB/templates/brave/install" brave-browser'
 rules:
   app:
     - The shared Brave install, read-only.
-    - bind: {path: $SBX_APPS/brave/current, dst: /opt/brave}
+    - bind: {path: $SBX_APPS/brave-browser/current, dst: /opt/brave}

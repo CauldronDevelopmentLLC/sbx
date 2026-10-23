@@ -10,8 +10,10 @@ m = importlib.util.module_from_spec(spec); loader.exec_module(m)
 
 OWN, OWN2, ROOT, OTHER = 0x200001, 0x200002, 0x500, 0x400010
 CLIPBOARD, DND_SEL, DND_POS, PROTOCOLS, TAKE_FOCUS, WM_S0, XEMBED = 500, 600, 601, 700, 701, 702, 703
+RES_MAN, DESK_NAMES, ACTIVE, CLIENTS = 801, 802, 803, 804
 NAMES = {CLIPBOARD: 'CLIPBOARD', 1: 'PRIMARY', DND_SEL: 'XdndSelection', DND_POS: 'XdndPosition', PROTOCOLS: 'WM_PROTOCOLS',
-         TAKE_FOCUS: 'WM_TAKE_FOCUS', WM_S0: 'WM_S0', XEMBED: '_XEMBED'}
+         TAKE_FOCUS: 'WM_TAKE_FOCUS', WM_S0: 'WM_S0', XEMBED: '_XEMBED',
+         RES_MAN: 'RESOURCE_MANAGER', DESK_NAMES: '_NET_DESKTOP_NAMES', ACTIVE: '_NET_ACTIVE_WINDOW', CLIENTS: '_NET_CLIENT_LIST'}
 
 class Server:
   '''The trusted connection's answers, set by the tests.'''
@@ -24,7 +26,10 @@ class Server:
   def __init__(self): self.focus_window, self.owners = OWN, {}
   def focus(self): return self.focus_window
   def owner(self, selection): return self.owners.get(selection, 0)
-  def public(self, window, atom): return atom == 39 # As if public
+  def access(self, window, atom):
+    name = self.name(atom)
+    if window in self.roots: return 'windows' if name in m.ROOT_WINDOW_LISTS else 'read' if name in m.ROOT_PROPERTIES else None
+    return 'read' if atom == 39 else None # As if public
   def name(self, atom): return NAMES.get(atom, str(atom))
   def pasted(self, keycode, mods): return (CLIPBOARD,) if keycode == 55 and mods & m.CONTROL else ()
 
@@ -223,7 +228,7 @@ check('KeyPress passed with PointerRoot focus', c.sf(key(2, 38, 0)) == key(2, 38
 c = client()
 gp = lambda window, prop: req(20, 0, struct.pack('<IIIII', window, prop, 0, 0, 100))
 check('GetProperty foreign private faked', run(c, gp(OTHER, 400)) == GIF and c.pending[-1][1] == 'reply')
-for name, r in (('foreign public', gp(OTHER, 39)), ('root', gp(ROOT, 400)), ('own', gp(OWN, 400))):
+for name, r in (('foreign public', gp(OTHER, 39)), ('root RESOURCE_MANAGER', gp(ROOT, RES_MAN)), ('own', gp(OWN, 400))):
   check(f'GetProperty {name} passed', run(c, r) == r)
 
 c = client()
@@ -265,7 +270,7 @@ c.sf(struct.pack('<BxHIIIIII4x', 30, 0, 0, OWN, OTHER, CLIPBOARD, 31, 900))
 check('ChangeProperty answering a selection request passed', run(c, cp(OTHER, 900)) == cp(OTHER, 900))
 check('ChangeProperty of another property dropped', run(c, cp(OTHER, 901)) == NOOP)
 check('DeleteProperty on root dropped', run(c, req(19, 0, struct.pack('<II', ROOT, 400))) == NOOP)
-check('GetProperty on root never deletes', run(c, req(20, 1, struct.pack('<IIIII', ROOT, 400, 0, 0, 100))) == req(20, 0, struct.pack('<IIIII', ROOT, 400, 0, 0, 100)))
+check('GetProperty on root never deletes', run(c, req(20, 1, struct.pack('<IIIII', ROOT, RES_MAN, 0, 0, 100))) == req(20, 0, struct.pack('<IIIII', ROOT, RES_MAN, 0, 0, 100)))
 check('PutImage on a host window dropped', run(c, req(72, 2, struct.pack('<II', OTHER, 0) + bytes(16))) == NOOP)
 big = struct.pack('<BBHII', 72, 2, 0, 1 + 1 + 20000, OTHER) + bytes(79996)
 check('big PutImage on a host window dropped', run(c, big[:5000]) + run(c, big[5000:]) == NOOP)
@@ -317,6 +322,62 @@ check('SelectionRequest to a host window dropped', run(c, se(OTHER, struct.pack(
 r = se(OTHER, struct.pack('<BxHIIIII8x', 31, 0, 0, OTHER, CLIPBOARD, 31, 900)); check('SelectionNotify to a host window passed', run(c, r) == r)
 check('Expose to a host window dropped', run(c, se(OTHER, struct.pack('<B31x', 12))) == NOOP)
 r = se(ROOT, struct.pack('<BxHIIB19x', 18, 0, ROOT, OWN, 0)); check('UnmapNotify to root withdrawing an own window passed', run(c, r) == r)
+
+# Root window properties: allowed, filtered window lists or hidden
+c = client()
+gp = lambda window, prop, offset = 0: req(20, 0, struct.pack('<IIIII', window, prop, 0, offset, 100))
+def prop_reply(seq, values, after = 0): return struct.pack('<BBHIIII12x', 1, 32, seq, len(values), 33, after, len(values)) + struct.pack(f'<{len(values)}I', *values)
+check('root _NET_DESKTOP_NAMES hidden', run(c, gp(ROOT, DESK_NAMES)) == GIF and c.pending[-1][1] == 'reply')
+check('root unknown property hidden', run(c, gp(ROOT, 999)) == GIF)
+c.pending.clear() # Earlier requests were never answered
+run(c, gp(ROOT, CLIENTS))
+out = c.sf(prop_reply(c.seq, [OWN, OTHER, OWN2]))
+check('root _NET_CLIENT_LIST lists only sandbox windows', struct.unpack_from('<4I', out, 4)[0] == 2 and struct.unpack_from('<2I', out, 32) == (OWN, OWN2))
+c.pending.clear() # Earlier requests were never answered
+run(c, gp(ROOT, ACTIVE))
+out = c.sf(prop_reply(c.seq, [OTHER]))
+check('root _NET_ACTIVE_WINDOW of a host window reads as none', struct.unpack_from('<I', out, 16)[0] == 1 and struct.unpack_from('<I', out, 32)[0] == 0)
+c.pending.clear() # Earlier requests were never answered
+run(c, gp(ROOT, ACTIVE))
+check('root _NET_ACTIVE_WINDOW of a sandbox window kept', struct.unpack_from('<I', c.sf(prop_reply(c.seq, [OWN])), 32)[0] == OWN)
+c.pending.clear() # Earlier requests were never answered
+run(c, gp(ROOT, CLIENTS))
+check('partial window list reply hidden', c.sf(prop_reply(c.seq, [OWN], after = 4))[1] == 0)
+check('window list read at an offset hidden', run(c, gp(ROOT, CLIENTS, 1)) == GIF)
+c.pending.clear() # Earlier requests were never answered
+run(c, req(21, 0, struct.pack('<I', ROOT)))
+atoms = [RES_MAN, DESK_NAMES, ACTIVE, 999]
+out = c.sf(struct.pack('<BxHIH22x', 1, c.seq, len(atoms), len(atoms)) + struct.pack('<4I', *atoms))
+check('ListProperties on root lists only readable ones', struct.unpack_from('<H', out, 8)[0] == 2 and struct.unpack_from('<2I', out, 32) == (RES_MAN, ACTIVE))
+pn = lambda window, atom: struct.pack('<BxHIIIB15x', 28, 0, window, atom, 0, 0)
+check('PropertyNotify of a hidden root property dropped', c.sf(pn(ROOT, DESK_NAMES)) == b'')
+check('PropertyNotify of a readable root property passed', c.sf(pn(ROOT, RES_MAN)) == pn(ROOT, RES_MAN))
+check('PropertyNotify on an own window passed', c.sf(pn(OWN, 999)) == pn(OWN, 999))
+
+# Every core request is passed, checked or denied
+c = client()
+classified = [op for op in list(range(1, 120)) + [127] if c.checks[op] == c.deny]
+check('all core requests classified', not classified, classified)
+check('undefined core opcodes denied', all(c.checks[op] == c.deny for op in [0] + list(range(120, 127))))
+check('undefined core opcode 120 denied', run(c, req(120, 0, b'')) == GIF)
+check('FreePixmap of a host pixmap dropped', run(c, req(54, 0, struct.pack('<I', OTHER))) == NOOP)
+r = req(54, 0, struct.pack('<I', OWN)); check('FreePixmap own passed', run(c, r) == r)
+check('ChangeGC of a host GC dropped', run(c, req(56, 0, struct.pack('<II', OTHER, 0))) == NOOP)
+check('CopyGC into a host GC dropped', run(c, req(57, 0, struct.pack('<III', OWN, OTHER, 0))) == NOOP)
+r = req(38, 0, struct.pack('<I', ROOT)); check('QueryPointer passed', run(c, r) == r)
+check('RENDER obsolete minor 3 denied', run(c, req(131, 3, bytes(8))) == GIF)
+r = req(131, 0, struct.pack('<II', 0, 11)); check('RENDER QueryVersion passed', run(c, r) == r)
+check('XI undefined minor 62 denied', run(c, req(130, 62, bytes(4))) == GIF)
+r = req(132, 200, bytes(8)); check('GLX minors not limited', run(c, r) == r)
+
+# Big requests which are checked, e.g. ChangeProperty of a big icon
+c = client()
+icon = struct.pack('<BBHIIIIB3xI', 18, 0, 0, 1 + 1 + 5 + 100000, OWN, 39, 6, 32, 100000) + bytes(400000)
+check('big ChangeProperty on an own window streamed intact', run(c, icon[:3000]) + run(c, icon[3000:]) == icon)
+icon = struct.pack('<BBHIIIIB3xI', 18, 0, 0, 1 + 1 + 5 + 100000, OTHER, 39, 6, 32, 100000) + bytes(400000)
+check('big ChangeProperty on a host window dropped', run(c, icon) == NOOP)
+trap = struct.pack('<BBHIBxxxIIII', 131, 10, 0, 1 + 1 + 5 + 80000, 3, OWN, OWN2, 0, 0) + bytes(320000)
+check('big RENDER Trapezoids from own pictures streamed intact', run(c, trap) == trap)
 
 print(f'FAILED {fails}' if fails else 'all passed')
 sys.exit(1 if fails else 0)

@@ -159,6 +159,26 @@ rules:
     # Use portals, without pretending to be Flatpak
     - env: {GTK_USE_PORTAL: 1, GDK_DEBUG: portals, GIO_USE_PORTALS: 1,
             QT_QPA_PLATFORMTHEME: xdgdesktopportal}
+    # Links opened with xdg-open go to the host's default application, via
+    # the OpenURI portal.  Not "gio open", which would run this again.
+    - file:
+        path: /run/sbx/share/applications/sbx-open-uri.desktop
+        data: |
+          [Desktop Entry]
+          Type=Application
+          Name=Open on the host
+          Exec=gdbus call --session --dest org.freedesktop.portal.Desktop --object-path /org/freedesktop/portal/desktop --method org.freedesktop.portal.OpenURI.OpenURI "" %u {}
+          MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/mailto;
+          NoDisplay=true
+    - file:
+        path: /run/sbx/xdg/mimeapps.list
+        data: |
+          [Default Applications]
+          x-scheme-handler/http=sbx-open-uri.desktop
+          x-scheme-handler/https=sbx-open-uri.desktop
+          x-scheme-handler/mailto=sbx-open-uri.desktop
+    - env: {XDG_DATA_DIRS: '/run/sbx/share:/usr/local/share:/usr/share',
+            XDG_CONFIG_DIRS: '/run/sbx/xdg:/etc/xdg'}
 
   gpu:
     - Enables GPU access.
