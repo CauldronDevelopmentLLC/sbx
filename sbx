@@ -33,6 +33,7 @@ SANDBOX_CONFIG    = f'{SANDBOX_ROOT}/$SANDBOX/config.yml'
 SANDBOX_TEMPLATES = f'{XDG_DATA_HOME}/sbx-templates'
 SANDBOX_APPS      = f'{XDG_DATA_HOME}/sbx-apps' # Shared by templates
 DEFAULT_CONFIG    = f'{SANDBOX_ROOT}/global.yml'
+LOCAL_CONFIG      = f'{SANDBOX_ROOT}/local.yml' # Applied to all sandboxes
 APP_BASE       = 'org.sbx'
 SECCOMP_GROUPS = ('sockets', 'io-uring', 'keyring', 'userns')
 X11_LEVELS     = ('trusted', 'filtered', 'untrusted') # Most permissive first
@@ -45,7 +46,7 @@ DNS_FORWARD    = '192.0.2.53' # TEST-NET-1, pasta maps it to the host's resolver
 NS_GET_USERNS  = 0xb701       # From linux/nsfs.h
 PR_SET_SECCOMP, PR_CAPBSET_DROP, PR_SET_NO_NEW_PRIVS = 22, 24, 38
 SECCOMP_MODE_FILTER = 2
-PROXY_VARS     = ('http_proxy', 'https_proxy', 'ftp_proxy', 'all_proxy')
+PROXY_VARS     = ('http_proxy', 'https_proxy', 'ftp_proxy') # Set by proxy: <url>
 
 
 class SBError(Exception): pass
@@ -136,7 +137,8 @@ class SBX:
     self.dbus_forwards    = set()
     self.loaded           = set()
     self.applied          = []
-    self.rules            = {}
+    self.rules            = {} # Name or (path, _name) -> (path, actions)
+    self.origin           = None # Config of the rule being applied
     self.runtime_dir      = os.environ['XDG_RUNTIME_DIR']
     self.tempdirs         = set()
     self.die_with_parent  = False
@@ -147,6 +149,7 @@ class SBX:
     self.net              = None
     self.allow_net        = set()
     self.host_ports       = set()
+    self.proxies          = set()
 
 
   def log(self, s):
@@ -196,12 +199,20 @@ class SBX:
         imp = os.path.relpath(imp, os.path.dirname(path))
       self.load_config(imp)
 
-    # Load rules (overwriting previous)
+    # Load rules (overwriting previous), those starting with _ are private
     for name, rule in rules.items():
-      self.rules[name] = rule
+      self.rules[(npath, name) if name.startswith('_') else name] = \
+        (npath, rule)
 
     # Save config (overwriting previous)
-    self.config = config
+    self.config, self.config_path = config, npath
+
+
+  def load_local(self):
+    '''Load local.yml, if any, and return its path and the rules it uses.'''
+    if not os.path.exists(self.expand_path(LOCAL_CONFIG)): return None, []
+    self.load_config(LOCAL_CONFIG)
+    return self.config_path, self.config.get('use', [])
 
 
   def run_hook(self, name, extra_env = None):
@@ -221,20 +232,26 @@ class SBX:
     return os.waitstatus_to_exitcode(status)
 
 
-  def apply_rule(self, rule):
+  def apply_rule(self, rule, origin = None):
     if isinstance(rule, list):
-      for r in rule: self.apply_rule(r)
+      for r in rule: self.apply_rule(r, origin)
       return
 
     # Rule names can contain variable references
     rules = self.expand(rule)
 
+    # Private rules are found in the config of the rule using them
+    key = (origin or self.origin, rule) if rule.startswith('_') else rule
+    if key not in self.rules: raise SBError(f'Unknown rule "{rule}"')
+
     # Only apply each rule once
-    if rule in self.applied: return
-    self.applied.append(rule)
+    if key in self.applied: return
+    self.applied.append(key)
 
     self.log(f'Applying rule {rule}')
-    self.apply_actions(self.rules[rule])
+    prev, (self.origin, actions) = self.origin, self.rules[key]
+    self.apply_actions(actions)
+    self.origin = prev
 
 
   def apply_actions(self, actions):
@@ -381,6 +398,22 @@ class SBX:
   def action_host_port(self, params):
     if not isinstance(params, list): params = [params]
     self.host_ports.update(int(port) for port in params)
+
+
+  def action_proxy(self, params):
+    if params is True:
+      names = [var for name in PROXY_VARS + ('all_proxy', 'no_proxy')
+               for var in (name, name.upper()) if os.environ.get(var)]
+      self.action_env(names)
+      self.proxies.update(
+        os.environ[var] for var in names if var.lower() != 'no_proxy')
+
+    elif isinstance(params, str):
+      self.action_env(
+        {var: params for name in PROXY_VARS for var in (name, name.upper())})
+      self.proxies.add(self.expand(params))
+
+    else: raise SBError('"proxy" requires a URL or true')
 
 
   def action_file(self, params):
@@ -653,10 +686,7 @@ class SBX:
 
 
   def allow_proxies(self):
-    values = {os.environ.get(var) for name in PROXY_VARS
-              for var in (name, name.upper())} - {None, ''}
-
-    for value in values:
+    for value in self.proxies:
       try:
         url = urllib.parse.urlsplit(
           value if '://' in value else f'http://{value}')
@@ -804,6 +834,7 @@ class SBX:
   def run(self):
     # Load config
     self.require_config()
+    local_path, local_use = self.load_local()
     self.load_config(SANDBOX_CONFIG)
 
     # Pre-run hook
@@ -827,7 +858,8 @@ class SBX:
     self.state = f'{self.runtime_dir}/sbx/{self.args.name}/{os.getpid()}'
 
     # Apply rules
-    self.apply_rule(self.config.get('use', []))
+    self.apply_rule(self.config.get('use', []), self.config_path)
+    self.apply_rule(local_use, local_path)
     self.setup_seccomp()
     self.sync_r, self.sync_w = os.pipe() # See watch_sandbox()
     self.setup_portal()
@@ -909,8 +941,16 @@ class SBX:
       rules   = self.args.rule    or self.config.get('use', [])
       config_data = dict(use = rules, command = command)
 
-      if self.args.config: config_data['rules']   = self.rules
-      else:                config_data['imports'] = [config]
+      if self.args.config:
+        # Private rules of all configs end up in one
+        config_data['rules'] = {}
+        for key, (_, rule) in self.rules.items():
+          name = key if isinstance(key, str) else key[1]
+          if name in config_data['rules']:
+            raise SBError(f'Private rule "{name}" is in several configs')
+          config_data['rules'][name] = rule
+
+      else: config_data['imports'] = [config]
 
       with open(sandbox_config, 'w') as f:
         yaml.dump(
@@ -936,18 +976,20 @@ class SBX:
   def list_rules(self):
     # Load default config
     config = self.args.config if self.args.config else self.default_config()
+    self.load_local()
     self.load_config(config)
 
-    width = reduce(lambda x, name: max(len(name), x), self.rules, 0)
+    rules = {k: r for k, (_, r) in self.rules.items() if isinstance(k, str)}
+    width = reduce(lambda x, name: max(len(name), x), rules, 0)
 
-    for rule in sorted(self.rules):
+    for rule in sorted(rules):
       help = ''
 
-      first = self.rules[rule][:1]
+      first = rules[rule][:1]
       if len(first) and isinstance(first[0], str): help = first[0]
 
       use = []
-      for action in self.rules[rule]:
+      for action in rules[rule]:
         if isinstance(action, dict):
           for name, params in action.items():
             if name == 'use':

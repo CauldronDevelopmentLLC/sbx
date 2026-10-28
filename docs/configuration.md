@@ -26,6 +26,21 @@ imports: [$SBX_LIB/global.yml]
 in ``$SBX_LIB``.  New sandboxes import ``~/.config/sbx/global.yml`` instead,
 if it exists.
 
+Rules whose names start with ``_`` are private to their config, so they do
+not collide with or override rules of the same name in other configs.
+
+``~/.config/sbx/local.yml``, if it exists, holds the machine's defaults.  Its
+``use`` is applied to every sandbox, after the sandbox's own, and the
+sandbox's rules override its rules.  Other keys are ignored.  E.g. for a proxy
+which only login shells know about:
+
+```yaml
+use: [_proxy]
+rules:
+  _proxy:
+    - proxy: http://172.16.1.1:3128/
+```
+
 ## Variables
 
 Strings may reference environment variables, ``$NAME`` or ``${NAME}``, and
@@ -162,6 +177,12 @@ Enable portals, see [D-Bus and portals](security.md#d-bus-and-portals).
 
 ### ``proc: <path> | {path: <path>, perms: <perms>}``
 Mount a new ``/proc``.
+
+### ``proxy: <url> | true``
+Set ``http_proxy``, ``https_proxy``, ``ftp_proxy`` and their upper case forms
+to ``<url>`` or, with ``true``, copy those, ``all_proxy`` and ``no_proxy`` from
+sbx's environment.  Connections to the proxies are allowed, see
+[Network](security.md#network).
 
 ### ``skel: <path>``
 Copy ``/etc/skel`` to the path, without overwriting, and add the sandbox's

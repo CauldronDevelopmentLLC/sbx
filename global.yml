@@ -45,6 +45,13 @@ rules:
     - Allow access to the host's CUPS printing service on localhost:631.
     - host-port: 631
 
+  proxy:
+    - >-
+      Pass the proxies in sbx's environment, e.g. http_proxy, to the sandbox
+      and allow connections to them.  For another proxy use e.g.
+      "proxy: http://proxy:3128" in local.yml.
+    - proxy: true
+
   downloads:
     - Bind the user's Downloads directory.
     - bind: {path: $HOME/Downloads, read-write: true}

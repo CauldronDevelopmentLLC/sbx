@@ -4,6 +4,13 @@
 app=${1:-brave-browser}
 . "$SBX_LIB/templates/app.sh"
 
+# Brave's keys for GitHub checksums, from brave.com/signing-keys.  Release
+# builds are pre-releases, signed with the pre-release key, until promoted.
+case $app in
+  *-nightly|*-beta) key=checksums-pre-release.asc pre=1 ;;
+  *) key=checksums-release.asc pre= ;;
+esac
+
 info=$(curl -fsS --proto =https \
   'https://api.github.com/repos/brave/brave-browser/releases?per_page=100' |
   python3 -c '
@@ -11,11 +18,12 @@ import json, re, sys
 name = re.compile(re.escape(sys.argv[1]) + r"-([0-9.]+)-linux-" + sys.argv[2] +
                   r"\.zip")
 for release in json.load(sys.stdin):
+  if release["prerelease"] and not sys.argv[3]: continue
   for asset in release["assets"]:
     if match := name.fullmatch(asset["name"]):
       sys.exit(print(match[1], asset["browser_download_url"]))
 sys.exit("No release of " + sys.argv[1] + " found")' \
-  "$app" "$(arch amd64 arm64)")
+  "$app" "$(arch amd64 arm64)" "$pre")
 read -r version url <<< "$info"
 
 check "$version"
@@ -24,12 +32,6 @@ zip=${url##*/}
 fetch "$url"
 fetch "$url.sha256"
 fetch "$url.sha256.asc"
-
-# Brave's keys for GitHub checksums, from brave.com/signing-keys
-case $app in
-  *-nightly|*-beta) key=checksums-pre-release.asc ;;
-  *) key=checksums-release.asc ;;
-esac
 
 log "Verifying"
 gpg --homedir "$tmp" -q --dearmor < "${0%/*}/$key" > "$tmp/key.gpg"

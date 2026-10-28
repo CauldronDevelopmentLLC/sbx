@@ -41,10 +41,10 @@ Rules which relax this:
 ``no-net`` gives loopback only.  ``allow-net`` unblocks ranges or single TCP
 ports, e.g. a VPN's subnet, but not the host's addresses.
 
-Proxies in sbx's ``http_proxy``, ``https_proxy``, ``ftp_proxy`` and
-``all_proxy``, or their upper case forms, are allowed automatically, only on
-their port.  A proxy on the host's loopback is forwarded as with
-``host-port``.  Hostnames are resolved when the sandbox starts.
+The ``proxy`` action allows its proxies, only on their port, see ``proxy``
+in ``global.yml`` and ``local.yml`` in [Configuration](configuration.md).
+A proxy on the host's loopback is forwarded as with ``host-port``.  Hostnames
+are resolved when the sandbox starts.
 
 ## D-Bus and portals
 
