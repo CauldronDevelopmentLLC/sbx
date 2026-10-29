@@ -2,6 +2,31 @@
 
 Features discussed but not yet implemented.
 
+## System scope and services
+
+Containerize system services, e.g. those installed by `.deb` packages, the
+same way as desktop software and development projects.
+
+### Scopes and search path
+Look up containers, templates, images and `local.yml` in the user's
+directories, then `/etc/sbx` (admin), then `$SBX_LIB` (vendor, e.g.
+`/usr/lib/sbx` for packages).  A file earlier in the path shadows a later
+one, an override can import the shadowed file by path.  System scope homes
+in `/var/lib/sbx/containers/<name>`, via `StateDirectory=` for units
+with `User=`.  Machine defaults, e.g. a proxy, in `/etc/sbx/local.yml`.
+
+### Single file containers and templates
+`<name>.yml` next to `<name>/config.yml`, for the latter when scripts
+are shipped.  Packages drop `/usr/lib/sbx/containers/<name>.yml` and use
+`ExecStart=/usr/bin/sbx run <name>` in their unit.
+
+### Service support
+`sd_notify`, binding `NOTIFY_SOCKET`, and socket activation, passing
+`LISTEN_FDS`, where `LISTEN_PID` does not match inside a PID namespace.
+Verify what bwrap leaves root without a user namespace, refuse root or drop
+all capabilities until then.  `listen-port` with addresses, e.g.
+`0.0.0.0/443`.
+
 ## Security primitives
 
 ### cwd blacklist

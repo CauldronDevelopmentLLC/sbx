@@ -9,7 +9,7 @@ can read ``~/.ssh``, alter startup scripts, copy browser data or read your
 passwords as you type them.  sbx gives each application only the access it
 needs: a private home, the directories you choose, the internet but not your
 local network, and a display it cannot use to spy on other applications.  It
-needs no root privileges, daemons or container images.
+needs no root privileges, daemons or OCI container images.
 
 ## Quick start
 
@@ -41,9 +41,8 @@ sbx run npm install
 Each sandbox has its own home in ``~/.local/share/sbx/containers/<name>`` and
 config in ``~/.config/sbx/containers/<name>/config.yml``.  Sandboxes made from
 the same template share one read-only install of the program, an image in
-``~/.local/share/sbx/images``.
-``sbx list-rules`` shows the rules available, see
-[Configuration](docs/configuration.md) to write your own.
+``~/.local/share/sbx/images``.  ``sbx list-rules`` shows the rules available,
+see [Configuration](docs/configuration.md) to write your own.
 
 ## Threats
 
@@ -84,13 +83,6 @@ fish completions, or under ``$PREFIX``, and a ``tmpfiles.d`` entry for
 ``/run/sbx``, where users without ``XDG_RUNTIME_DIR``, e.g. system services,
 keep their state.  Install by copying, never by linking to a checkout which a
 sandbox can write.  ``make check`` runs the tests.
-
-To upgrade from the layout before templates were imported, move each
-``~/.config/sbx/<name>`` to ``~/.config/sbx/containers/<name>``, each
-``~/.local/share/sbx/<name>`` to ``~/.local/share/sbx/containers/<name>`` and
-``~/.local/share/sbx-apps/*`` to ``~/.local/share/sbx/images/``.  Then replace
-each ``config.yml`` made from a template with ``imports: [<template>]``, and
-in the others ``imports: [$SBX_LIB/global.yml]`` with ``imports: [global]``.
 
 On X11, see also [X11](docs/security.md#x11) on removing the X server's
 access grant by user.

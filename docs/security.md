@@ -41,6 +41,9 @@ Rules which relax this:
 ``no-net`` gives loopback only.  ``allow-net`` unblocks ranges or single TCP
 ports, e.g. a VPN's subnet, but not the host's addresses.
 
+``host-port`` forwards ports on the sandbox's ``localhost`` to the host's, so
+it can reach services listening there on those ports.
+
 ``listen-port`` exposes ports of the sandbox on the host's ``127.0.0.1``,
 where anything on the host, including other sandboxes with ``host-port``, can
 connect to them.  Connections arrive on the sandbox's loopback, so servers
