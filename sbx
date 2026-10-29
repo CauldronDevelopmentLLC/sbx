@@ -245,7 +245,7 @@ class SBX:
     name = self.expand_path(name)
     if '/' in name or name.endswith('.yml'):
       return os.path.join(base or os.getcwd(), name)
-    return self.find_template(name) + '/config.yml'
+    return self.find_template(name)
 
 
   def run_hook(self, name, extra_env = None):
@@ -355,7 +355,9 @@ class SBX:
   def action_bind(self, params):
     if isinstance(params, str): params = {'path': params}
 
-    src = os.getcwd() if params.get('cwd', False) else params['path']
+    if params.get('cwd', False): src = os.getcwd()
+    elif 'image' in params: src = self.install_image(params['image'])
+    else: src = params['path']
     dst = params.get('dst', src)
     src = self.expand(src)
     dst = self.expand(dst)
@@ -379,6 +381,16 @@ class SBX:
       path = f'{root}/{name}/current'
       if os.path.exists(path): return path
     raise SBError(f'Image "{name}" not found')
+
+
+  def install_image(self, name):
+    '''An image's path, running the update-hook first if it is missing.'''
+    name = self.expand(name)
+    try: return self.find_image(name)
+    except SBError:
+      if self.run_hook('update-hook'):
+        raise SBError(f'"update-hook" failed to install image "{name}"')
+      return self.find_image(name)
 
 
   def copy_image(self, name, dst):
@@ -1132,14 +1144,17 @@ class SBX:
 
 
   def find_template(self, name):
-    '''User templates first, so they can replace those installed with sbx.'''
+    '''A template's config, <name>.yml or <name>/config.yml, user templates
+    first, so they can replace those installed with sbx.'''
     roots = (self.expand_path(SANDBOX_TEMPLATES), f'{SBX_LIB}/templates')
     for root in roots:
-      if os.path.isfile(f'{root}/{name}/config.yml'): return f'{root}/{name}'
+      for path in (f'{root}/{name}.yml', f'{root}/{name}/config.yml'):
+        if os.path.isfile(path): return path
 
-    names = sorted({n for root in roots if os.path.isdir(root)
-                    for n in os.listdir(root)
-                    if os.path.isfile(f'{root}/{n}/config.yml')})
+    names = sorted({n.removesuffix('.yml') for root in roots
+                    if os.path.isdir(root) for n in os.listdir(root)
+                    if n.endswith('.yml') or
+                    os.path.isfile(f'{root}/{n}/config.yml')})
     raise SBError(f'Template "{name}" not found, available: ' +
                   (', '.join(names) or 'none'))
 
@@ -1158,11 +1173,13 @@ class SBX:
 
     # Only replace the image of the template being replaced
     owned = False
-    if os.path.exists(target):
+    existing = [p for p in (f'{target}.yml', f'{target}/config.yml')
+                if os.path.isfile(p)]
+    if existing:
       if not self.args.force:
         raise SBError(
           f'Template "{name}" already exists; use --force to overwrite')
-      with open(f'{target}/config.yml') as f:
+      with open(existing[0]) as f:
         owned = (yaml.full_load(f) or {}).get('home') == name
 
     if os.path.exists(image) and os.path.isdir(home) and not owned:
@@ -1183,6 +1200,7 @@ class SBX:
           shutil.rmtree(f'{image}/{old}')
 
     # Copy the config dir (config.yml + any hook scripts)
+    if os.path.isfile(f'{target}.yml'): os.remove(f'{target}.yml')
     if os.path.exists(target): shutil.rmtree(target)
     shutil.copytree(os.path.dirname(config), target, symlinks = True)
 

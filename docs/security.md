@@ -62,9 +62,10 @@ Sandboxes never connect to the host's session bus.  With the ``portal`` or
 
 - ``file-chooser`` - Files are chosen in the host's dialog and only those are
   exposed, via the host's document portal.
-- ``open-uri``     - ``http``, ``https`` and ``mailto`` links open in the
-  host's default application, also those opened with ``xdg-open``.  Files
-  open only after the user picks an application.  Executables are refused.
+- ``open-uri``     - ``http``, ``https``, ``mailto`` and ``magnet`` links open
+  in the host's default application, also those opened with ``xdg-open``.
+  Files open only after the user picks an application.  Executables are
+  refused.
 - ``print``        - Printing via the host's print dialog.  Browsers' own print
   previews need CUPS, see the ``cups`` rule, otherwise use their system
   dialog, e.g. Chrome's Ctrl+Shift+P or Firefox's

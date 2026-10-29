@@ -4,12 +4,20 @@ function __fish_sbx_sandboxes
     path filter -d $XDG_CONFIG_HOME/sbx/containers/* | path basename
 end
 
-# Helper function to list templates, the user's and those installed with sbx
+# Helper function to list templates, <name>.yml or <name>/config.yml, the
+# user's and those installed with sbx
 function __fish_sbx_templates
     set -q XDG_CONFIG_HOME || set XDG_CONFIG_HOME $HOME/.config
-    set -l lib (path resolve (command -s sbx) | path dirname)/../lib/sbx
-    set -l dirs $XDG_CONFIG_HOME/sbx/templates/* $lib/templates/* # No error if none
-    path filter -d $dirs | path basename | sort -u
+    set -l lib (path resolve (command -s sbx) | path dirname)
+    test -d $lib/../lib/sbx && set lib $lib/../lib/sbx # Else a checkout
+    set -l files $XDG_CONFIG_HOME/sbx/templates/{*.yml,*/config.yml} \
+        $lib/templates/{*.yml,*/config.yml} # No error if none
+    string replace -r '(/config)?\.yml$' '' $files | path basename | sort -u
+end
+
+# Helper function to list the rules available
+function __fish_sbx_rules
+    sbx list-rules 2>/dev/null | string replace -r ' .*' ''
 end
 
 # Common options
@@ -31,8 +39,8 @@ complete -x -c sbx -n __fish_use_subcommand -a enter -d 'Enter a running sandbox
 complete -x -c sbx -n __fish_use_subcommand -a template -d 'Create a template from an existing sandbox'
 
 # Options for 'create' subcommand
-complete -f -c sbx -n '__fish_seen_subcommand_from create' -s r -l rule -d 'Rule or rules to apply, in addition to the template\'s'
-complete -x -c sbx -n '__fish_seen_subcommand_from create' -s t -l template -d 'Create from template' -a '(__fish_sbx_templates)'
+complete -x -c sbx -n '__fish_seen_subcommand_from create' -s r -l rule -d 'Rule or rules to apply, in addition to the template\'s' -a '(__fish_sbx_rules)'
+complete -c sbx -n '__fish_seen_subcommand_from create' -s t -l template -d 'Template to import, or a path' -a '(__fish_sbx_templates)'
 
 # Options for 'delete' subcommand
 complete -f -c sbx -n '__fish_seen_subcommand_from delete' -s f -l force -d 'Delete without asking'

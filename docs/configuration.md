@@ -42,12 +42,13 @@ rules:
 
 ## Templates
 
-A template is a directory with a ``config.yml`` and any scripts it uses,
-looked up by name in ``~/.config/sbx/templates``, then in
-``$SBX_LIB/templates``, so yours replace those installed with sbx.  An import
-containing ``/`` or ending in ``.yml`` is a path instead, relative to the
-importing config.  A config's keys override those of its imports, except
-``use``, which adds to them, and ``rules``, see above.
+A template is a ``<name>.yml`` file, or a ``<name>`` directory with a
+``config.yml`` and any scripts it uses, looked up by name in
+``~/.config/sbx/templates``, then in ``$SBX_LIB/templates``, so yours replace
+those installed with sbx.  An import containing ``/`` or ending in ``.yml``
+is a path instead, relative to the importing config.  A config's keys
+override those of its imports, except ``use``, which adds to them, and
+``rules``, see above.
 
 ``sbx create <name> -t <template>`` creates a sandbox importing the template,
 ``default`` if neither ``-t`` nor ``-r`` is given, ``global`` if only ``-r``
@@ -55,22 +56,23 @@ is.  ``-r`` and a command are added to the new config.  ``sbx template <name>
 <template>`` saves a sandbox's config directory as a template and its home as
 an image of the same name, which new sandboxes made from it are filled from.
 
-Those installed with sbx install their program on the host, as an image, and
-bind it read-only into each sandbox made from them:
+Those installed with sbx install their program on the host, as an image,
+with their ``update-hook`` and bind it read-only into each sandbox made from
+them.  Binding a missing image runs the ``update-hook``, so the program is
+installed on the first run:
 
 ```yaml
 use: [browser, private-home, _local]
 command: [/opt/brave/brave]
 imports: [global]
-pre-hook: '[ -e "$SBX_IMAGES/brave-browser/current" ] || install brave-browser'
 update-hook: install brave-browser
 rules:
   _local:
-    - bind: {path: $SBX_IMAGES/brave-browser/current, dst: /opt/brave}
+    - bind: {image: brave-browser, dst: /opt/brave}
 ```
 
-Install scripts use the helpers in ``$SBX_LIB/templates/app.sh``.  They must
-verify downloads before unpacking them and never run anything downloaded.
+Install scripts use the helpers in ``$SBX_LIB/app.sh``.  They must verify
+downloads before unpacking them and never run anything downloaded.
 
 Firefox based browsers, e.g. Floorp, keep a default profile per install path.
 After copying a home from another install, choose its profile once with e.g.
@@ -102,7 +104,8 @@ Shell commands run on the host with ``bash -c``:
 - ``create-hook`` - After ``sbx create``.
 - ``pre-hook``    - Before the command starts.
 - ``post-hook``   - After the command exits, with ``$SANDBOX_EXIT_CODE``.
-- ``update-hook`` - On ``sbx update``.
+- ``update-hook`` - On ``sbx update`` and to install a missing image, see
+  ``bind``.
 - ``delete-hook`` - Before ``sbx delete`` removes any files.
 
 Hooks get the variables above and the directory of the config defining the
@@ -130,6 +133,8 @@ Pass arguments to ``bwrap``, e.g. ``args: [--unshare-pid]``.
 Bind a host path, read-only by default.  Keys:
 
 - ``path``       - Source path.
+- ``image``      - Bind an image instead, see [Images](#images), running the
+  ``update-hook`` first if it is missing.
 - ``dst``        - Destination path, defaults to ``path``.
 - ``read-write`` - Writable bind.
 - ``dev``        - Allow device access.

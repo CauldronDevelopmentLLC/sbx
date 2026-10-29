@@ -9,6 +9,7 @@ PROGRAMS := sbx sbx-portal sbx-x11
 install: root
 	install -d $(BIN) $(LIB) $(BASH) $(FISH) $(TMPFILES)
 	install -m 755 $(PROGRAMS) $(BIN)
+	install -m 644 app.sh $(LIB)
 	cp -R templates images $(LIB)
 	chmod -R u+w,go-w,a+rX $(LIB)/templates $(LIB)/images
 	install -m 644 completions/sbx.completion $(BASH)/sbx

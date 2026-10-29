@@ -46,7 +46,7 @@ PASSTHROUGH = {
 }
 LOCAL       = ('file-chooser', 'open-uri', 'print') # Need the backend
 PORTALS     = LOCAL + tuple(PASSTHROUGH)
-URI_SCHEMES = ('http', 'https', 'mailto')
+URI_SCHEMES = ('http', 'https', 'mailto', 'magnet')
 VERSIONS    = {FILE_CHOOSER: 3, OPEN_URI: 4, DOCUMENTS: 4, PRINT: 2}
 
 # Document portal AddFull flags

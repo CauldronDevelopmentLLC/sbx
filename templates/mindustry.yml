@@ -1,0 +1,33 @@
+# Mindustry, run with the host's Java 17 or later.  Sandboxes made from this
+# template share one read-only jar, downloaded on the first run and updated
+# with "sbx update".
+use: [gui, gpu, audio, private-home, _local]
+command: [java, -jar, /opt/mindustry/Mindustry.jar]
+imports: [global]
+update-hook: |
+  app=mindustry
+  . "$SBX_LIB/app.sh"
+
+  # The latest release, without pre-releases, and the jar's digest from GitHub
+  info=$(curl -fsS --proto =https \
+    https://api.github.com/repos/Anuken/Mindustry/releases/latest |
+    python3 -c '
+  import json, sys
+  release = json.load(sys.stdin)
+  jar = next(a for a in release["assets"] if a["name"] == "Mindustry.jar")
+  print(release["tag_name"].removeprefix("v"), jar["browser_download_url"],
+        jar["digest"].removeprefix("sha256:"))')
+  read -r version url sha <<< "$info"
+
+  check "$version"
+
+  mkdir "$tmp/unpacked"
+  fetch "$url" "$tmp/unpacked/Mindustry.jar"
+  log "Verifying"
+  echo "$sha  $tmp/unpacked/Mindustry.jar" | sha256sum -c --quiet
+  activate "$version" "$tmp/unpacked"
+rules:
+  _local:
+    - The shared Mindustry jar, read-only.
+    - bind: {image: mindustry, dst: /opt/mindustry}
+    - x11-allow: keyboard-control # It turns off key repeat while playing

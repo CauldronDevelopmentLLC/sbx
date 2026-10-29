@@ -1,0 +1,43 @@
+# Floorp.  Sandboxes made from this template share one read-only install,
+# installed on the first run and updated with "sbx update".
+use: [browser, firefox, private-home, _local]
+command: [/opt/floorp/floorp]
+imports: [global]
+update-hook: |
+  app=floorp
+  . "$SBX_LIB/app.sh"
+
+  asset=floorp-linux-$(arch x86_64 aarch64).tar.xz
+  info=$(curl -fsS --proto =https \
+    'https://api.github.com/repos/Floorp-Projects/Floorp/releases/latest' |
+    python3 -c '
+  import json, sys
+  release = json.load(sys.stdin)
+  asset = next(a for a in release["assets"] if a["name"] == sys.argv[1])
+  print(release["tag_name"].lstrip("v"), asset["browser_download_url"],
+        asset["digest"])' "$asset")
+  read -r version url digest <<< "$info"
+
+  check "$version"
+
+  # Floorp publishes no checksum for the archive, GitHub's digest guards
+  # against corruption
+  fetch "$url"
+  log "Verifying"
+  echo "${digest#sha256:}  $tmp/$asset" | sha256sum -c --quiet
+
+  log "Unpacking"
+  mkdir "$tmp/unpacked"
+  tar -xJf "$tmp/$asset" -C "$tmp/unpacked"
+  root=$(root "$tmp/unpacked")
+
+  # The install is read-only, it is updated with "sbx update"
+  mkdir -p "$root/distribution"
+  echo '{"policies": {"DisableAppUpdate": true}}' \
+    > "$root/distribution/policies.json"
+
+  activate "$version" "$root"
+rules:
+  _local:
+    - The shared Floorp install, read-only.
+    - bind: {image: floorp, dst: /opt/floorp}

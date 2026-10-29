@@ -3,9 +3,8 @@
 use: [browser, private-home, _local]
 command: [/opt/brave/brave]
 imports: [global]
-pre-hook: '[ -e "$SBX_IMAGES/brave-browser/current" ] || install brave-browser'
 update-hook: install brave-browser
 rules:
   _local:
     - The shared Brave install, read-only.
-    - bind: {path: $SBX_IMAGES/brave-browser/current, dst: /opt/brave}
+    - bind: {image: brave-browser, dst: /opt/brave}

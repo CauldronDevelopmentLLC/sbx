@@ -1,0 +1,33 @@
+# Claude Code with the current directory.  Sandboxes made from this template
+# share one read-only install, installed on the first run and updated with
+# "sbx update".  Log in once, the credentials stay in the sandbox's home.
+use: [cli, private-home, _local]
+command: [/opt/claude-code/claude]
+imports: [global]
+update-hook: |
+  app=claude-code
+  . "$SBX_LIB/app.sh"
+
+  base=https://downloads.claude.ai/claude-code-releases
+  platform=linux-$(arch x64 arm64)
+  version=$(curl -fsS --proto =https "$base/latest")
+  [[ $version =~ ^[0-9]+(\.[0-9]+)+$ ]] || version= # E.g. an error page
+
+  check "$version"
+
+  sha=$(curl -fsS --proto =https "$base/$version/manifest.json" |
+    python3 -c 'import json, sys
+  print(json.load(sys.stdin)["platforms"][sys.argv[1]]["checksum"])' \
+    "$platform")
+  mkdir "$tmp/unpacked"
+  fetch "$base/$version/$platform/claude" "$tmp/unpacked/claude"
+
+  log "Verifying"
+  echo "$sha  $tmp/unpacked/claude" | sha256sum -c --quiet
+  chmod 755 "$tmp/unpacked/claude"
+  activate "$version" "$tmp/unpacked"
+rules:
+  _local:
+    - The shared Claude Code install, read-only.
+    - bind: {image: claude-code, dst: /opt/claude-code}
+    - env: {DISABLE_AUTOUPDATER: 1} # Updated with "sbx update"

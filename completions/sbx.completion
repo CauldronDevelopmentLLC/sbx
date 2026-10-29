@@ -6,20 +6,24 @@ _sbx_completions() {
   CMDS="create run update rename list ps enter list-rules delete show edit"
   CMDS+=" template help"
   SBCMDS="run update rename enter delete show edit template"
-  LIB="$(dirname "$(readlink -f "$(command -v sbx)")")/../lib/sbx"
+  LIB="$(dirname "$(readlink -f "$(command -v sbx)")")"
+  [ -d "$LIB/../lib/sbx" ] && LIB+=/../lib/sbx # Else a checkout, as sbx does
 
   case "$prev" in
-    -t|--template)
-      local dir tpls=""
-      for dir in "${XDG_CONFIG_HOME:-$HOME/.config}/sbx/templates" \
-                 "$LIB/templates"; do
-        [ -d "$dir" ] && tpls+=" $(cd "$dir" && ls -d */ 2>/dev/null)"
+    -t|--template|-c|--config) # Template names, <name>.yml or <name>/, or paths
+      local t tpls="" user="${XDG_CONFIG_HOME:-$HOME/.config}/sbx/templates"
+      for t in "$user"/{*.yml,*/config.yml} \
+               "$LIB"/templates/{*.yml,*/config.yml}; do
+        [ -e "$t" ] || continue
+        t=${t%/config.yml}; t=${t%.yml}; tpls+=" ${t##*/}"
       done
-      COMPREPLY=( $(compgen -W "${tpls//\//}" -- ${cur}) )
+      COMPREPLY=( $(compgen -W "$tpls" -- ${cur}) )
+      [[ $cur == */* ]] && COMPREPLY+=( $(compgen -f -- ${cur}) )
       return
       ;;
-    -c|--config)
-      COMPREPLY=( $(compgen -f -- ${cur}) )
+    -r|--rule)
+      COMPREPLY=( $(compgen -W "$(sbx list-rules 2>/dev/null | cut -d' ' -f1)" \
+                    -- ${cur}) )
       return
       ;;
   esac

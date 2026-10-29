@@ -2,7 +2,7 @@
 # Installs or updates a Brave variant in $SBX_IMAGES/<variant>, e.g.
 # brave-browser, brave-origin or brave-origin-nightly
 app=${1:-brave-browser}
-. "$SBX_LIB/templates/app.sh"
+. "$SBX_LIB/app.sh"
 
 # Brave's keys for GitHub checksums, from brave.com/signing-keys.  Release
 # builds are pre-releases, signed with the pre-release key, until promoted.

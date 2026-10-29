@@ -176,7 +176,7 @@ rules:
           Type=Application
           Name=Open on the host
           Exec=gdbus call --session --dest org.freedesktop.portal.Desktop --object-path /org/freedesktop/portal/desktop --method org.freedesktop.portal.OpenURI.OpenURI "" %u {}
-          MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/mailto;
+          MimeType=x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/mailto;x-scheme-handler/magnet;
           NoDisplay=true
     - file:
         path: /run/sbx/xdg/mimeapps.list
@@ -185,6 +185,7 @@ rules:
           x-scheme-handler/http=sbx-open-uri.desktop
           x-scheme-handler/https=sbx-open-uri.desktop
           x-scheme-handler/mailto=sbx-open-uri.desktop
+          x-scheme-handler/magnet=sbx-open-uri.desktop
     - env: {XDG_DATA_DIRS: '/run/sbx/share:/usr/local/share:/usr/share',
             XDG_CONFIG_DIRS: '/run/sbx/xdg:/etc/xdg'}
 

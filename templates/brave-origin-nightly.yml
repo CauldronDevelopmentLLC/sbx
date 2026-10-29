@@ -3,11 +3,8 @@
 use: [browser, private-home, _local]
 command: [/opt/brave/brave]
 imports: [global]
-pre-hook: >-
-  [ -e "$SBX_IMAGES/brave-origin-nightly/current" ] ||
-  "$SBX_LIB/templates/brave/install" brave-origin-nightly
 update-hook: '"$SBX_LIB/templates/brave/install" brave-origin-nightly'
 rules:
   _local:
     - The shared Brave Origin nightly install, read-only.
-    - bind: {path: $SBX_IMAGES/brave-origin-nightly/current, dst: /opt/brave}
+    - bind: {image: brave-origin-nightly, dst: /opt/brave}
