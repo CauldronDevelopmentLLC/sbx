@@ -82,7 +82,9 @@ applications need their own setting, e.g. Firefox's
 All instances of a sandbox share one bus, so single instance applications
 work.  It stops after the last instance exits, so configuration changes apply
 once all instances have exited.  The bus and ``portal.log`` are in
-``$XDG_RUNTIME_DIR/sbx/<sandbox>/``.
+``$XDG_RUNTIME_DIR/sbx/<sandbox>/``.  Without ``XDG_RUNTIME_DIR``, e.g. in a
+system service, sbx keeps its state in ``/run/sbx/<uid>`` and D-Bus and X11
+are unavailable.
 
 ## Display
 

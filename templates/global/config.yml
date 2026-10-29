@@ -28,7 +28,7 @@ rules:
     - bind: /usr/include
     - symlink: [usr/bin, /bin]
     - symlink: [usr/bin, /sbin]
-    - tmpfs: {path: $XDG_RUNTIME_DIR, perms: 0o700}
+    - ifdef: [XDG_RUNTIME_DIR, {tmpfs: {path: $XDG_RUNTIME_DIR, perms: 0o700}}]
     - bind: {path: /run/systemd/resolve, try: true}
 
   host-net:

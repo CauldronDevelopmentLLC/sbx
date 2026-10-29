@@ -18,7 +18,7 @@ import ipaddress
 import signal
 import time
 import urllib.parse
-from functools import reduce
+from functools import reduce, cached_property
 from collections import defaultdict
 
 try: import seccomp
@@ -134,7 +134,6 @@ class SBX:
     self.applied          = []
     self.rules            = {} # Name or (path, _name) -> (path, actions)
     self.origin           = None # Config of the rule being applied
-    self.runtime_dir      = os.environ['XDG_RUNTIME_DIR']
     self.tempdirs         = set()
     self.die_with_parent  = False
     self.allowed_syscalls = set()
@@ -147,6 +146,29 @@ class SBX:
     self.host_ports       = set()
     self.listen_ports     = set()
     self.proxies          = set()
+
+
+  @cached_property
+  def runtime_dir(self):
+    '''$XDG_RUNTIME_DIR or, e.g. for services, a private dir in /run/sbx.'''
+    if 'XDG_RUNTIME_DIR' in os.environ: return os.environ['XDG_RUNTIME_DIR']
+
+    path = f'/run/sbx/{os.getuid()}'
+    try: os.mkdir(path, 0o700)
+    except FileExistsError: pass
+    except OSError as e: raise SBError(f'Cannot create "{path}": {e}')
+
+    # /run/sbx is writable by all, another user could have made it
+    st = os.lstat(path)
+    if not os.path.isdir(path) or os.path.islink(path) or \
+       st.st_uid != os.getuid() or st.st_mode & 0o077:
+      raise SBError(f'"{path}" is not a private directory of this user')
+    return path
+
+
+  def require_session(self, feature):
+    if 'XDG_RUNTIME_DIR' not in os.environ:
+      raise SBError(f'{feature} requires a desktop session, XDG_RUNTIME_DIR')
 
 
   def log(self, s):
@@ -574,6 +596,7 @@ class SBX:
 
     display = os.environ.get('DISPLAY')
     if not display: raise SBError('"x11" requires DISPLAY')
+    self.require_session('"x11"')
 
     # Host based access, e.g. "SI:localuser", bypasses the cookie and, with the
     # host's network, the proxy
@@ -835,6 +858,7 @@ class SBX:
 
   def setup_portal(self):
     if not (self.portals or self.dbus_forwards): return
+    self.require_session('D-Bus')
 
     app_id = os.environ['APP_NAME']
     dir    = f'{self.runtime_dir}/sbx/{self.args.name}'

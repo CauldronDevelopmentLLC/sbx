@@ -1,0 +1,3 @@
+# Private runtime directories, /run/sbx/<uid>, of users without
+# XDG_RUNTIME_DIR, e.g. system services
+d /run/sbx 1777 root root -

@@ -80,8 +80,10 @@ On Debian, or the equivalent packages on other distributions:
 ``util-linux`` 2.39 or later is needed.  ``make install`` installs ``sbx``,
 ``sbx-portal`` and ``sbx-x11`` in ``/usr/local/bin``, templates, including the
 default rules in ``global``, and images in ``/usr/local/lib/sbx`` and bash and
-fish completions, or under ``$PREFIX``.  Install by copying, never by linking
-to a checkout which a sandbox can write.  ``make check`` runs the tests.
+fish completions, or under ``$PREFIX``, and a ``tmpfiles.d`` entry for
+``/run/sbx``, where users without ``XDG_RUNTIME_DIR``, e.g. system services,
+keep their state.  Install by copying, never by linking to a checkout which a
+sandbox can write.  ``make check`` runs the tests.
 
 To upgrade from the layout before templates were imported, move each
 ``~/.config/sbx/<name>`` to ``~/.config/sbx/containers/<name>``, each
