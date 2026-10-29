@@ -1,15 +1,13 @@
 # Claude Code with the current directory.  Sandboxes made from this template
 # share one read-only install, installed on the first run and updated with
 # "sbx update".  Log in once, the credentials stay in the sandbox's home.
-use: [cli, private-home, app]
+use: [cli, private-home, _local]
 command: [/opt/claude-code/claude]
-imports: [$SBX_LIB/global.yml]
-pre-hook: >-
-  [ -e "$SBX_APPS/claude-code/current" ] ||
-  "$SBX_LIB/templates/claude-code/install"
-update-hook: '"$SBX_LIB/templates/claude-code/install"'
+imports: [global]
+pre-hook: '[ -e "$SBX_IMAGES/claude-code/current" ] || install'
+update-hook: install
 rules:
-  app:
+  _local:
     - The shared Claude Code install, read-only.
-    - bind: {path: $SBX_APPS/claude-code/current, dst: /opt/claude-code}
+    - bind: {path: $SBX_IMAGES/claude-code/current, dst: /opt/claude-code}
     - env: {DISABLE_AUTOUPDATER: 1} # Updated with "sbx update"

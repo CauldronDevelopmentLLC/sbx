@@ -1,0 +1,4 @@
+# The default for "sbx create" without --template or --rule.
+use: [common, private-home]
+command: [bash]
+imports: [global]

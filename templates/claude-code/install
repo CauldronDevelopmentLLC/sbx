@@ -1,5 +1,5 @@
 #!/bin/bash
-# Installs or updates Claude Code in $SBX_APPS/claude-code
+# Installs or updates Claude Code in $SBX_IMAGES/claude-code
 app=claude-code
 . "$SBX_LIB/templates/app.sh"
 

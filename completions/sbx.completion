@@ -11,7 +11,7 @@ _sbx_completions() {
   case "$prev" in
     -t|--template)
       local dir tpls=""
-      for dir in "${XDG_DATA_HOME:-$HOME/.local/share}/sbx-templates" \
+      for dir in "${XDG_CONFIG_HOME:-$HOME/.config}/sbx/templates" \
                  "$LIB/templates"; do
         [ -d "$dir" ] && tpls+=" $(cd "$dir" && ls -d */ 2>/dev/null)"
       done

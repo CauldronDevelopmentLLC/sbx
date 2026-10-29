@@ -16,6 +16,7 @@ import termios
 import json
 import ipaddress
 import signal
+import time
 import urllib.parse
 from functools import reduce
 from collections import defaultdict
@@ -27,15 +28,15 @@ except ImportError: import pyseccomp as seccomp
 XDG_CONFIG_HOME = os.environ.get('XDG_CONFIG_HOME', '$HOME/.config')
 XDG_DATA_HOME   = os.environ.get('XDG_DATA_HOME', '$HOME/.local/share')
 
-SANDBOX_ROOT      = f'{XDG_CONFIG_HOME}/sbx'
-SANDBOX_HOME      = f'{XDG_DATA_HOME}/sbx/$SANDBOX'
+SANDBOX_ROOT      = f'{XDG_CONFIG_HOME}/sbx/containers'
+SANDBOX_HOME      = f'{XDG_DATA_HOME}/sbx/containers/$SANDBOX'
 SANDBOX_CONFIG    = f'{SANDBOX_ROOT}/$SANDBOX/config.yml'
-SANDBOX_TEMPLATES = f'{XDG_DATA_HOME}/sbx-templates'
-SANDBOX_APPS      = f'{XDG_DATA_HOME}/sbx-apps' # Shared by templates
-DEFAULT_CONFIG    = f'{SANDBOX_ROOT}/global.yml'
-LOCAL_CONFIG      = f'{SANDBOX_ROOT}/local.yml' # Applied to all sandboxes
+SANDBOX_TEMPLATES = f'{XDG_CONFIG_HOME}/sbx/templates'
+SANDBOX_IMAGES    = f'{XDG_DATA_HOME}/sbx/images'
+LOCAL_CONFIG      = f'{XDG_CONFIG_HOME}/sbx/local.yml' # Used by all sandboxes
 APP_BASE       = 'org.sbx'
 SECCOMP_GROUPS = ('sockets', 'io-uring', 'keyring', 'userns')
+X11_SETTINGS   = ('keyboard-control', 'pointer-control', 'screen-saver')
 X11_LEVELS     = ('trusted', 'filtered', 'untrusted') # Most permissive first
 NET_MODES      = ('host', 'isolated', 'none')         # Most permissive first
 # Private, shared, link-local and multicast ranges
@@ -46,7 +47,7 @@ DNS_FORWARD    = '192.0.2.53' # TEST-NET-1, pasta maps it to the host's resolver
 NS_GET_USERNS  = 0xb701       # From linux/nsfs.h
 PR_SET_SECCOMP, PR_CAPBSET_DROP, PR_SET_NO_NEW_PRIVS = 22, 24, 38
 SECCOMP_MODE_FILTER = 2
-PROXY_VARS     = ('http_proxy', 'https_proxy', 'ftp_proxy') # Set by proxy: <url>
+PROXY_VARS     = ('http_proxy', 'https_proxy', 'ftp_proxy') # For proxy: <url>
 
 
 class SBError(Exception): pass
@@ -77,25 +78,6 @@ def fork_and_write(data):
   return pr
 
 
-def copytree(src, dst):
-  src = os.path.realpath(src)
-
-  for root, dirs, files in os.walk(src):
-    target = os.path.join(dst, root[len(src):])
-
-    for dir in dirs:
-      tgtPath = os.path.join(target, dir)
-      if not os.path.exists(tgtPath):
-        os.makedirs(tgtPath)
-        shutil.copystat(os.path.join(root, dir), tgtPath)
-
-    for file in files:
-      tgtPath = os.path.join(target, file)
-      if not os.path.exists(tgtPath):
-        #print('{} -> {}'.format(os.path.join(root, file), tgtPath))
-        shutil.copy2(os.path.join(root, file), tgtPath)
-
-
 def display_in_use(num):
   with socket.socket(socket.AF_UNIX) as s:
     try: s.connect(f'\0/tmp/.X11-unix/X{num}')
@@ -112,6 +94,15 @@ def parse_allow_net(s):
   else: addr, port = s, ''
 
   return ipaddress.ip_network(addr), int(port) if port else None
+
+
+def parse_ports(s):
+  '''Parse "<port>" or "<first>-<last>" into a pasta port spec.'''
+  first, _, last = s.partition('-')
+  try: first, last = int(first), int(last or first)
+  except ValueError: first = last = 0
+  if not 0 < first <= last < 65536: raise ValueError(f'Invalid port "{s}"')
+  return f'{first}-{last}' if first < last else str(first)
 
 
 def find_lib():
@@ -132,6 +123,10 @@ def get_pid_ns(pid = os.getpid()):
 class SBX:
   def __init__(self, args):
     self.args             = args
+    self.config           = {}
+    self.origins          = {} # Config which set each key
+    self.uses             = [] # (config, rules) in load order
+    self.local_uses       = []
     self.cmd_args         = []
     self.portals          = set()
     self.dbus_forwards    = set()
@@ -145,10 +140,12 @@ class SBX:
     self.allowed_syscalls = set()
     self.x11              = None
     self.x11_auth_id      = None
+    self.x11_allow        = set()
     self.portal_lock      = None
     self.net              = None
     self.allow_net        = set()
     self.host_ports       = set()
+    self.listen_ports     = set()
     self.proxies          = set()
 
 
@@ -182,7 +179,7 @@ class SBX:
 
     self.log(f'Loading config "{path}"')
 
-    with open(path) as f: config = yaml.full_load(f)
+    with open(path) as f: config = yaml.full_load(f) or {}
     rules = config.get('rules', {})
 
     if not isinstance(rules, dict):
@@ -194,9 +191,9 @@ class SBX:
       raise SBError('"imports" is not a list')
 
     for imp in imports:
-      imp = self.expand_path(imp)
-      if not os.path.isabs(imp):
-        imp = os.path.relpath(imp, os.path.dirname(path))
+      imp = self.resolve_config(imp, os.path.dirname(path))
+      if os.path.normpath(imp) == npath:
+        raise SBError(f'"{path}" imports itself')
       self.load_config(imp)
 
     # Load rules (overwriting previous), those starting with _ are private
@@ -204,22 +201,37 @@ class SBX:
       self.rules[(npath, name) if name.startswith('_') else name] = \
         (npath, rule)
 
-    # Save config (overwriting previous)
-    self.config, self.config_path = config, npath
+    # Keys override those of imports, "use" adds to them
+    for key, value in config.items():
+      if key in ('imports', 'rules'): continue
+      if key == 'use': self.uses.append((npath, value))
+      else: self.config[key], self.origins[key] = value, npath
 
 
   def load_local(self):
-    '''Load local.yml, if any, and return its path and the rules it uses.'''
-    if not os.path.exists(self.expand_path(LOCAL_CONFIG)): return None, []
+    '''Load local.yml, if any.  Only its "use" is kept, applied last, and
+    configs loaded later may load its imports again, overriding its rules.'''
+    if not os.path.exists(self.expand_path(LOCAL_CONFIG)): return
     self.load_config(LOCAL_CONFIG)
-    return self.config_path, self.config.get('use', [])
+    self.local_uses, self.uses, self.config, self.origins, self.loaded = \
+      self.uses, [], {}, {}, set()
+
+
+  def resolve_config(self, name, base = None):
+    '''A path, relative to base or the current directory, if it has a "/" or
+    ends in ".yml", otherwise a template's name.'''
+    name = self.expand_path(name)
+    if '/' in name or name.endswith('.yml'):
+      return os.path.join(base or os.getcwd(), name)
+    return self.find_template(name) + '/config.yml'
 
 
   def run_hook(self, name, extra_env = None):
     hook = self.config.get(name)
     if not hook: return 0
 
-    config_dir = os.path.dirname(self.expand_path(SANDBOX_CONFIG))
+    # Scripts next to the config defining the hook can be called by name
+    config_dir = os.path.dirname(self.origins[name])
     env = os.environ.copy()
     env['PATH'] = config_dir + ':' + env.get('PATH', '')
     if extra_env: env.update(extra_env)
@@ -303,26 +315,16 @@ class SBX:
           self.cmd_args.extend(('--setenv', k, os.environ[k]))
 
 
-  def create_skel(self, path):
-    copytree('/etc/skel', path)
-    with open(path + '/.bashrc', 'a') as f:
-      f.write(f'\nPS1="({self.args.name}) $PS1"\n')
-
-
-  def action_skel(self, params):
-    if isinstance(params, str): params = {'path': params}
-    self.create_skel(self.expand(params['path']))
-
-
   def action_tmp_overlay(self, params):
     if isinstance(params, str): params = {'path': params}
 
     path = self.expand(params['path'])
 
-    if params.get('skel', False):
+    # A copy, the sandbox cannot change files it does not own, e.g. /etc/skel's
+    if 'image' in params:
       tempdir = tempfile.mkdtemp()
       self.tempdirs.add(tempdir)
-      shutil.copytree('/etc/skel', tempdir, dirs_exist_ok = True)
+      self.copy_image(params['image'], tempdir)
       self.cmd_args.extend(('--overlay-src', tempdir))
 
     self.cmd_args.extend((f'--tmp-overlay', path))
@@ -339,7 +341,7 @@ class SBX:
     create = params.get('create', False)
     if create and not os.path.exists(src):
       os.makedirs(src)
-      if create == 'skel': self.create_skel(src)
+      if isinstance(create, str): self.copy_image(create, src)
 
     if params.get('dev', False): type = 'dev-bind'
     else: type = 'bind' if params.get('read-write', False) else 'ro-bind'
@@ -347,6 +349,19 @@ class SBX:
 
     self.add_perms(params)
     self.cmd_args.extend((f'--{type}', src, dst))
+
+
+  def find_image(self, name):
+    '''User images first, so they can replace those installed with sbx.'''
+    for root in (self.expand_path(SANDBOX_IMAGES), f'{SBX_LIB}/images'):
+      path = f'{root}/{name}/current'
+      if os.path.exists(path): return path
+    raise SBError(f'Image "{name}" not found')
+
+
+  def copy_image(self, name, dst):
+    shutil.copytree(self.find_image(self.expand(name)), dst, symlinks = True,
+                    dirs_exist_ok = True)
 
 
   def action_hide(self, params):
@@ -388,6 +403,15 @@ class SBX:
   def action_net(self, params): self.set_level('net', NET_MODES, params)
 
 
+  def action_x11_allow(self, params):
+    if isinstance(params, str): params = [params]
+
+    for name in params:
+      if name not in X11_SETTINGS:
+        raise SBError(f'Unknown X11 setting "{name}"')
+      self.x11_allow.add(name)
+
+
   def action_allow_net(self, params):
     if isinstance(params, str): params = [params]
     try:
@@ -395,9 +419,18 @@ class SBX:
     except ValueError as e: raise SBError(f'"allow-net": {e}')
 
 
-  def action_host_port(self, params):
+  def add_ports(self, ports, name, params):
     if not isinstance(params, list): params = [params]
-    self.host_ports.update(int(port) for port in params)
+    try: ports.update(parse_ports(self.expand(port)) for port in params)
+    except ValueError as e: raise SBError(f'"{name}": {e}')
+
+
+  def action_host_port(self, params):
+    self.add_ports(self.host_ports, 'host-port', params)
+
+
+  def action_listen_port(self, params):
+    self.add_ports(self.listen_ports, 'listen-port', params)
 
 
   def action_proxy(self, params):
@@ -595,8 +628,9 @@ class SBX:
     sock = f'{dir}/X11-{os.getpid()}'
     os.makedirs(dir, mode = 0o700, exist_ok = True)
 
-    self.start_helper('sbx-x11', [display, sock, f'--exit-fd={self.sync_r}'],
-                      f'{dir}/x11.log', [self.sync_r])
+    allow = [f'--allow={name}' for name in sorted(self.x11_allow)]
+    self.start_helper('sbx-x11', [display, sock, f'--exit-fd={self.sync_r}'] +
+                      allow, f'{dir}/x11.log', [self.sync_r])
     self.cmd_args.extend(('--bind', sock, f'/tmp/.X11-unix/X{num}',
                           '--setenv', 'DISPLAY', f':{num}'))
 
@@ -700,7 +734,7 @@ class SBX:
       for *_, (addr, *_) in addrs:
         addr = ipaddress.ip_address(addr)
         # Only pasta's forwards reach the host's loopback
-        if addr.is_loopback: self.host_ports.add(url.port)
+        if addr.is_loopback: self.host_ports.add(str(url.port))
         else: self.allow_net.add((ipaddress.ip_network(addr), url.port))
 
 
@@ -730,8 +764,10 @@ class SBX:
     for fd in self.net_fds: os.close(fd)
     with open(self.net_info) as f: info = f.read()
     if not info: return # bwrap failed and reports why
-    pid   = str(json.loads(info)['child-pid'])
-    ports = ','.join(map(str, sorted(self.host_ports))) or 'none'
+    pid    = str(json.loads(info)['child-pid'])
+    ports  = ','.join(sorted(self.host_ports)) or 'none'
+    listen = ','.join(sorted(self.listen_ports))
+    listen = f'127.0.0.1/{listen}' if listen else 'none' # Host loopback only
 
     try:
       # The sandbox runs in a user namespace nested in the network's owner
@@ -742,7 +778,8 @@ class SBX:
       subprocess.run(
         ['pasta', '--config-net', '--quiet', '--userns', userns,
          '--map-host-loopback', 'none', '--map-guest-addr', 'none',
-         '--dns-forward', DNS_FORWARD, '-t', 'none', '-u', 'none', '-T', ports,
+         '--host-lo-to-ns-lo', # listen-port reaches servers on 127.0.0.1
+         '--dns-forward', DNS_FORWARD, '-t', listen, '-u', 'none', '-T', ports,
          '-U', 'none', pid], check = True)
 
       for version, rules in self.net_rules().items():
@@ -834,8 +871,9 @@ class SBX:
   def run(self):
     # Load config
     self.require_config()
-    local_path, local_use = self.load_local()
+    self.load_local()
     self.load_config(SANDBOX_CONFIG)
+    os.environ['HOME_IMAGE'] = self.config.get('home', 'skel')
 
     # Pre-run hook
     rc = self.run_hook('pre-hook')
@@ -858,8 +896,8 @@ class SBX:
     self.state = f'{self.runtime_dir}/sbx/{self.args.name}/{os.getpid()}'
 
     # Apply rules
-    self.apply_rule(self.config.get('use', []), self.config_path)
-    self.apply_rule(local_use, local_path)
+    for origin, rules in self.uses + self.local_uses:
+      self.apply_rule(rules, origin)
     self.setup_seccomp()
     self.sync_r, self.sync_w = os.pipe() # See watch_sandbox()
     self.setup_portal()
@@ -892,77 +930,34 @@ class SBX:
 
 
   def create(self):
-    # Check sandbox config
     sandbox_config = self.expand_path(SANDBOX_CONFIG)
     if os.path.exists(sandbox_config):
       raise SBError(f'Sandbox "{self.args.name}" already exists')
 
-    # Template and --config are mutually exclusive
-    if self.args.template and self.args.config:
-      raise SBError('--template and --config are mutually exclusive')
+    # Without -t, "default", or with -r only the rules given
+    template = self.args.template or ('global' if self.args.rule else 'default')
+    if '/' in template or template.endswith('.yml'):
+      template = os.path.abspath(template)
+    if not os.path.exists(self.resolve_config(template)):
+      raise SBError(f'Template "{template}" not found')
 
-    # --template forbids --rule and command overrides (copied verbatim)
-    if self.args.template and (self.args.rule or self.args.command):
-      raise SBError('--template cannot be combined with --rule or command')
+    config = dict(imports = [template])
+    if self.args.rule:    config['use']     = self.args.rule
+    if self.args.command: config['command'] = self.args.command
 
-    if self.args.template: template_dir = self.find_template(self.args.template)
-    config_dir = os.path.dirname(sandbox_config)
-    os.makedirs(config_dir, exist_ok = True)
+    os.makedirs(os.path.dirname(sandbox_config), exist_ok = True)
+    with open(sandbox_config, 'w') as f:
+      yaml.dump(config, f, Dumper = Dumper, width = 80, sort_keys = False,
+                default_flow_style = False)
 
-    if self.args.template:
-      # Copy template contents verbatim (config.yml, hook scripts, etc.)
-      # Skip 'home/' which is seeded separately into SANDBOX_HOME.
-      for entry in os.listdir(template_dir):
-        if entry == 'home': continue
-        src = os.path.join(template_dir, entry)
-        dst = os.path.join(config_dir, entry)
-        if os.path.isdir(src): shutil.copytree(src, dst, symlinks = True)
-        else: shutil.copy2(src, dst)
-
-      # Seed home from template
-      template_home = f'{template_dir}/home'
-      if os.path.isdir(template_home):
-        sandbox_home = self.expand_path(SANDBOX_HOME)
-        if os.path.exists(sandbox_home):
-          raise SBError(
-            f'Sandbox home "{sandbox_home}" already exists; refusing to ' +
-            'seed from template')
-        shutil.copytree(template_home, sandbox_home, symlinks = True)
-
-      # Load the newly-installed config so hooks can fire
-      self.load_config(SANDBOX_CONFIG)
-
-    else:
-      # --config or default: synthesize config_data, inline or import rules
-      config = self.args.config if self.args.config else self.default_config()
-      self.load_config(config)
-
-      command =self.args.command or self.config.get('command', ['bash'])
-      rules   = self.args.rule    or self.config.get('use', [])
-      config_data = dict(use = rules, command = command)
-
-      if self.args.config:
-        # Private rules of all configs end up in one
-        config_data['rules'] = {}
-        for key, (_, rule) in self.rules.items():
-          name = key if isinstance(key, str) else key[1]
-          if name in config_data['rules']:
-            raise SBError(f'Private rule "{name}" is in several configs')
-          config_data['rules'][name] = rule
-
-      else: config_data['imports'] = [config]
-
-      with open(sandbox_config, 'w') as f:
-        yaml.dump(
-          config_data, f, Dumper = Dumper, width = 80, sort_keys = False,
-          default_flow_style = False)
-
+    self.load_config(SANDBOX_CONFIG)
     rc = self.run_hook('create-hook')
     if rc != 0: sys.exit(rc)
 
 
   def list(self):
     root = self.expand_path(SANDBOX_ROOT)
+    if not os.path.isdir(root): return
     names = []
 
     for name in os.listdir(root):
@@ -974,10 +969,8 @@ class SBX:
 
 
   def list_rules(self):
-    # Load default config
-    config = self.args.config if self.args.config else self.default_config()
     self.load_local()
-    self.load_config(config)
+    self.load_config(self.resolve_config(self.args.config or 'global'))
 
     rules = {k: r for k, (_, r) in self.rules.items() if isinstance(k, str)}
     width = reduce(lambda x, name: max(len(name), x), rules, 0)
@@ -1114,12 +1107,6 @@ class SBX:
       os.rename(src, dst)
 
 
-  def default_config(self):
-    '''The user's global.yml, or the one installed with sbx.'''
-    if os.path.exists(self.expand_path(DEFAULT_CONFIG)): return DEFAULT_CONFIG
-    return '$SBX_LIB/global.yml'
-
-
   def find_template(self, name):
     '''User templates first, so they can replace those installed with sbx.'''
     roots = (self.expand_path(SANDBOX_TEMPLATES), f'{SBX_LIB}/templates')
@@ -1140,29 +1127,47 @@ class SBX:
 
   def template(self):
     config = self.require_config()
-    target = self.expand_path(
-      f'{SANDBOX_TEMPLATES}/{self.args.template_name}')
+    name   = self.args.template_name
+    target = self.expand_path(f'{SANDBOX_TEMPLATES}/{name}')
+    image  = self.expand_path(f'{SANDBOX_IMAGES}/{name}')
+    home   = self.expand_path(SANDBOX_HOME)
 
+    # Only replace the image of the template being replaced
+    owned = False
     if os.path.exists(target):
       if not self.args.force:
         raise SBError(
-          f'Template "{self.args.template_name}" already exists; use ' +
-          '--force to overwrite')
-      shutil.rmtree(target)
+          f'Template "{name}" already exists; use --force to overwrite')
+      with open(f'{target}/config.yml') as f:
+        owned = (yaml.full_load(f) or {}).get('home') == name
 
-    os.makedirs(target)
+    if os.path.exists(image) and os.path.isdir(home) and not owned:
+      raise SBError(f'Image "{name}" already exists')
 
-    # Copy entire sandbox config dir (config.yml + any hook scripts)
-    config_dir = os.path.dirname(config)
-    for entry in os.listdir(config_dir):
-      src = os.path.join(config_dir, entry)
-      dst = os.path.join(target, entry)
-      if os.path.isdir(src): shutil.copytree(src, dst, symlinks = True)
-      else: shutil.copy2(src, dst)
-
-    home = self.expand_path(SANDBOX_HOME)
+    # The home is saved as a new version of the image
     if os.path.isdir(home):
-      shutil.copytree(home, f'{target}/home', symlinks = True)
+      version = time.strftime('%Y%m%d%H%M%S')
+      prev = os.path.realpath(f'{image}/current')
+      shutil.copytree(home, f'{image}/{version}', symlinks = True)
+      os.symlink(version, f'{image}/.current')
+      os.replace(f'{image}/.current', f'{image}/current')
+
+      # Keep the previous version for sandboxes still running it
+      for old in os.listdir(image):
+        if old not in ('current', version) and \
+           os.path.realpath(f'{image}/{old}') != prev:
+          shutil.rmtree(f'{image}/{old}')
+
+    # Copy the config dir (config.yml + any hook scripts)
+    if os.path.exists(target): shutil.rmtree(target)
+    shutil.copytree(os.path.dirname(config), target, symlinks = True)
+
+    if os.path.isdir(home):
+      with open(f'{target}/config.yml') as f: data = yaml.full_load(f) or {}
+      data['home'] = name
+      with open(f'{target}/config.yml', 'w') as f:
+        yaml.dump(data, f, Dumper = Dumper, width = 80, sort_keys = False,
+                  default_flow_style = False)
 
 
   def edit(self):
@@ -1249,7 +1254,7 @@ class SBX:
 
     os.environ['SANDBOX_ROOT'] = self.expand(SANDBOX_ROOT)
     os.environ['SBX_LIB']      = SBX_LIB
-    os.environ['SBX_APPS']     = self.expand_path(SANDBOX_APPS)
+    os.environ['SBX_IMAGES']   = self.expand_path(SANDBOX_IMAGES)
 
     getattr(self, self.args.cmd.replace('-', '_'))()
 
@@ -1266,15 +1271,12 @@ subs = parser.add_subparsers(dest = 'cmd', metavar = '<subcommand>')
 
 create_parser = subs.add_parser('create', help = 'create a new sandbox')
 create_parser.add_argument(
-  '--config', '-c', help = 'override the default config file and copy the ' +
-  'rules to the new sandbox rather than import them')
+  '--template', '-t', help = 'template to import, from ' +
+  f'{SANDBOX_TEMPLATES} or {SBX_LIB}/templates, or a path, "default" ' +
+  'unless --rule is given')
 create_parser.add_argument(
-  '--template', '-t', help = 'create the sandbox from a template in ' +
-  f'{SANDBOX_TEMPLATES} or {SBX_LIB}/templates; mutually exclusive with ' +
-  '--config')
-create_parser.add_argument(
-  '--rule', '-r', action = 'append', help = 'rule or rules to apply ' +
-  'instead of the default rules')
+  '--rule', '-r', action = 'append', help = 'rule or rules to apply, in ' +
+  'addition to the template\'s')
 create_parser.add_argument('name', help = 'name of the sandbox')
 create_parser.add_argument(
   'command', nargs = '*', help = 'the command to run and optional arguments, ' +
@@ -1291,7 +1293,9 @@ subs.add_parser('list', help = 'list existing sandboxes')
 subs.add_parser('ps',   help = 'list running sandboxes')
 
 lr_parser = subs.add_parser('list-rules', help = 'list available rules')
-lr_parser.add_argument('--config', '-c', help = 'override the default config')
+lr_parser.add_argument(
+  '--config', '-c', help = 'template or path to list the rules of, ' +
+  'default "global"')
 
 del_parser = subs.add_parser('delete', help = 'delete an existing sandbox')
 del_parser.add_argument('name', help = 'name of the sandbox')

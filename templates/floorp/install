@@ -1,5 +1,5 @@
 #!/bin/bash
-# Installs or updates Floorp in $SBX_APPS/floorp
+# Installs or updates Floorp in $SBX_IMAGES/floorp
 app=floorp
 . "$SBX_LIB/templates/app.sh"
 

@@ -1,13 +1,11 @@
 # Brave.  Sandboxes made from this template share one read-only install,
 # installed on the first run and updated with "sbx update".
-use: [browser, private-home, app]
+use: [browser, private-home, _local]
 command: [/opt/brave/brave]
-imports: [$SBX_LIB/global.yml]
-pre-hook: >-
-  [ -e "$SBX_APPS/brave-browser/current" ] ||
-  "$SBX_LIB/templates/brave/install" brave-browser
-update-hook: '"$SBX_LIB/templates/brave/install" brave-browser'
+imports: [global]
+pre-hook: '[ -e "$SBX_IMAGES/brave-browser/current" ] || install brave-browser'
+update-hook: install brave-browser
 rules:
-  app:
+  _local:
     - The shared Brave install, read-only.
-    - bind: {path: $SBX_APPS/brave-browser/current, dst: /opt/brave}
+    - bind: {path: $SBX_IMAGES/brave-browser/current, dst: /opt/brave}

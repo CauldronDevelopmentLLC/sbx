@@ -41,8 +41,13 @@ Rules which relax this:
 ``no-net`` gives loopback only.  ``allow-net`` unblocks ranges or single TCP
 ports, e.g. a VPN's subnet, but not the host's addresses.
 
-The ``proxy`` action allows its proxies, only on their port, see ``proxy``
-in ``global.yml`` and ``local.yml`` in [Configuration](configuration.md).
+``listen-port`` exposes ports of the sandbox on the host's ``127.0.0.1``,
+where anything on the host, including other sandboxes with ``host-port``, can
+connect to them.  Connections arrive on the sandbox's loopback, so servers
+bound to ``127.0.0.1`` receive them and see them as local.
+
+The ``proxy`` action allows its proxies, only on their port, see the
+``proxy`` rule and ``local.yml`` in [Configuration](configuration.md).
 A proxy on the host's loopback is forwarded as with ``host-port``.  Hostnames
 are resolved when the sandbox starts.
 
@@ -132,6 +137,7 @@ DBE, DRI3 and GLX.  It also:
 - Blocks server wide changes: keyboard and pointer mappings and settings, XKB
   keymaps and controls, XInput devices, font path, access control, screen
   configuration, ``GrabServer`` and ``KillClient`` of other clients.
+  ``x11-allow`` allows keyboard and pointer settings and the screen saver's.
 - Allows setting the focus, taking CLIPBOARD or PRIMARY and pointer warps
   only while a sandbox window has the focus or within 2 seconds of user input
   in the sandbox, drag messages only while a button pressed in the sandbox is

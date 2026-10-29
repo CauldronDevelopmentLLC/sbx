@@ -1,5 +1,4 @@
-use: [common, private-home]
-command: [bash]
+# The rules every template builds on, see "sbx list-rules".
 rules:
   common:
     - >-
@@ -17,6 +16,7 @@ rules:
     - env: {PATH: /usr/bin:/bin}
     - env: [LANG, XDG_RUNTIME_DIR, XDG_SESSION_TYPE, TERM, HOME, LOGNAME, USER,
             EDITOR, SANDBOX]
+    - env: {debian_chroot: $SANDBOX} # The sandbox's name in Debian's prompt
     - bind: /etc
     - symlink: [/usr/lib, /lib]
     - symlink: [/usr/lib64, /lib64]
@@ -71,19 +71,20 @@ rules:
     - env: {SANDBOX_DATA: /sandbox-data}
 
   private-home:
-    - Creates a private writable home directory.
+    - >-
+      Creates a private writable home directory, filled from the template's
+      home image on the first run.
     - bind:
         path: $SANDBOX_HOME
         dst: $HOME
-        create: 'skel'
+        create: $HOME_IMAGE
         read-write: true
 
     - use: [make-home]
 
   tmp-home:
-    - Creates a temporary home directory.
-    - tmp-overlay: {path: $HOME, skel: true}
-    - env: {debian_chroot: $SANDBOX}
+    - Creates a temporary home directory, filled from the template's home image.
+    - tmp-overlay: {path: $HOME, image: $HOME_IMAGE}
     - use: [make-home]
 
   cli:
@@ -223,13 +224,6 @@ rules:
       A web browser with GPU, audio including the microphone, cameras,
       ~/Downloads and its own sandbox.
     - use: [gui, gpu, audio, video, downloads, userns]
-
-  vscode:
-    - >-
-      Visual Studio Code.  Add "cwd" for the current directory.  The sandbox
-      outlives the "code" command, which returns once the window opens.
-    - use: [gui, gpu, userns]
-    - die-with-parent: false
 
   firefox:
     - A special rule for running the Firefox web browser.

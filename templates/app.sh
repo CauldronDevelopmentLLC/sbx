@@ -1,10 +1,10 @@
 # Sourced by templates' install scripts, which run on the host.  Downloads are
 # verified before they are unpacked and nothing downloaded is run.  Versions
-# are installed side by side in $SBX_APPS/$app, "current" points to the newest
+# are installed side by side in $SBX_IMAGES/$app, "current" points to the newest
 # and the previous one is kept for sandboxes still running it.
 set -euo pipefail
 
-dir=$SBX_APPS/$app
+dir=$SBX_IMAGES/$app
 mkdir -p "$dir"
 exec 9> "$dir/.lock"
 flock 9

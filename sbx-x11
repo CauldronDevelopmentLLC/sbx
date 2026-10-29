@@ -74,6 +74,10 @@ RESOURCE_WRITES = (4, 5, 6, 8, 9, 10, 11, 12, 13, 28, 46, 54, 58, 59, 60, 61,
 DRAWS = (64, 65, 66, 67, 68, 69, 70, 71, 72, 74, 75, 76, 77) # E.g. PutImage
 # Server wide, e.g. SetFontPath, ChangeKeyboardMapping, ChangeHosts
 GLOBAL_WRITES = (51, 100, 102, 105, 107, 109, 111, 116, 118)
+# Server wide settings which --allow passes, ChangeKeyboardControl, e.g. key
+# repeat, ChangePointerControl, e.g. acceleration, and SetScreenSaver
+SETTINGS = {'keyboard-control': 102, 'pointer-control': 105,
+            'screen-saver': 107}
 
 # Events
 KEY_PRESS, KEY_RELEASE, BUTTON_PRESS, BUTTON_RELEASE = 2, 3, 4, 5
@@ -611,6 +615,7 @@ class Client:
     self.checks = [self.deny] * 256
     for op in CORE_ALLOWED: self.checks[op] = None
     for op, check in CORE_CHECKS.items(): self.checks[op] = get(check)
+    for op in self.proxy.allowed: self.checks[op] = None
 
     for op in range(128, 256):
       name = self.server.ops.get(op)
@@ -1165,10 +1170,11 @@ CORE_CHECKS = {
 class Proxy:
   '''Relays all clients' connections in one event loop.'''
 
-  def __init__(self, num, listen, verbose):
+  def __init__(self, num, listen, verbose, allow):
     self.num     = num
     self.listen  = listen
     self.verbose = verbose
+    self.allowed = {SETTINGS[name] for name in allow}
     self.auth    = host_auth(num)
     self.server  = Server(num, self.auth)
     self.buf     = memoryview(bytearray(RECV_SIZE)) # Shared, see Client.send()
@@ -1274,11 +1280,14 @@ def main():
                       help = 'write "x" to this fd once ready')
   parser.add_argument('--exit-fd', type = int, required = True,
                       help = 'exit when this fd reaches EOF')
+  parser.add_argument('--allow', action = 'append', default = [],
+                      choices = SETTINGS, help = 'server wide settings ' +
+                      'the sandbox may change, may be repeated')
   parser.add_argument('--verbose', action = 'store_true')
   args = parser.parse_args()
 
   proxy = Proxy(int(args.display.split(':')[1].split('.')[0]), args.listen,
-                args.verbose)
+                args.verbose, args.allow)
   os.write(args.ready_fd, b'x')
   os.close(args.ready_fd)
   log(f'X11 proxy for {args.display} on {args.listen}')

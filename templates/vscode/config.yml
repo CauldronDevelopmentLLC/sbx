@@ -1,14 +1,15 @@
 # Visual Studio Code.  Sandboxes made from this template share one read-only
 # install, installed on the first run and updated with "sbx update".
-# Extensions are per sandbox.
-use: [vscode, private-home, app]
+# Extensions are per sandbox.  Add "cwd" to "use" for the current directory.
+use: [private-home, gui, gpu, userns, _local]
 command: [/opt/vscode/bin/code]
-imports: [$SBX_LIB/global.yml]
-pre-hook: >-
-  [ -e "$SBX_APPS/vscode/current" ] ||
-  "$SBX_LIB/templates/vscode/install"
-update-hook: '"$SBX_LIB/templates/vscode/install"'
+imports: [global]
+pre-hook: '[ -e "$SBX_IMAGES/vscode/current" ] || install'
+update-hook: install
 rules:
-  app:
-    - The shared VSCode install, read-only.
-    - bind: {path: $SBX_APPS/vscode/current, dst: /opt/vscode}
+  _local:
+    - >-
+      The shared VSCode install, read-only.  The sandbox outlives the "code"
+      command, which returns once the window opens.
+    - bind: {path: $SBX_IMAGES/vscode/current, dst: /opt/vscode}
+    - die-with-parent: false

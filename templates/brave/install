@@ -1,5 +1,5 @@
 #!/bin/bash
-# Installs or updates a Brave variant in $SBX_APPS/<variant>, e.g.
+# Installs or updates a Brave variant in $SBX_IMAGES/<variant>, e.g.
 # brave-browser, brave-origin or brave-origin-nightly
 app=${1:-brave-browser}
 . "$SBX_LIB/templates/app.sh"

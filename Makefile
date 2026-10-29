@@ -8,10 +8,8 @@ PROGRAMS := sbx sbx-portal sbx-x11
 install: root
 	install -d $(BIN) $(LIB) $(BASH) $(FISH)
 	install -m 755 $(PROGRAMS) $(BIN)
-	install -m 644 global.yml $(LIB)
-	rm -rf $(LIB)/templates
-	cp -R templates $(LIB)
-	chmod -R u+w,go-w,a+rX $(LIB)/templates
+	cp -R templates images $(LIB)
+	chmod -R u+w,go-w,a+rX $(LIB)/templates $(LIB)/images
 	install -m 644 completions/sbx.completion $(BASH)/sbx
 	install -m 644 completions/sbx.fish $(FISH)/sbx.fish
 

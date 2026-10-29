@@ -46,7 +46,7 @@ class Feed:
 def client(p = None, base = 0x200000):
   if not p:
     p = m.Proxy.__new__(m.Proxy) # No sockets
-    p.server, p.clients, p.paste, p.writes = Server(), set(), {}, {}
+    p.server, p.clients, p.paste, p.writes, p.allowed = Server(), set(), {}, {}, set()
     p.input_until = p.focus_until = p.drag_until = 0
   c = m.Client.__new__(m.Client)
   c.proxy, c.server, c.verbose, c.seq, c.pending, c.c_rem, c.s_rem = p, p.server, False, 0, deque(), 0, 0
@@ -277,6 +277,11 @@ check('big PutImage on a host window dropped', run(c, big[:5000]) + run(c, big[5
 check('CopyArea to a host window dropped', run(c, req(62, 0, struct.pack('<IIIhhhhHH', OWN, OTHER, OWN2, 0, 0, 0, 0, 1, 1))) == NOOP)
 for op, name in ((51, 'SetFontPath'), (100, 'ChangeKeyboardMapping'), (109, 'ChangeHosts'), (111, 'SetAccessControl')):
   check(f'{name} denied', run(c, req(op, 0, b'')) == GIF and c.pending[-1][2][0] == m.BAD_ACCESS)
+check('ChangeKeyboardControl denied', run(c, req(102, 0, bytes(4))) == GIF and c.pending[-1][2][0] == m.BAD_ACCESS)
+a = client()
+a.proxy.allowed = {m.SETTINGS['keyboard-control']}; a.build_checks()
+check('ChangeKeyboardControl allowed', run(a, req(102, 0, bytes(4))) == req(102, 0, bytes(4)))
+check('ChangePointerControl still denied', run(a, req(105, 0, bytes(8))) == GIF)
 check('GrabServer dropped', run(c, req(36, 0, b'')) == NOOP)
 check('KillClient AllTemporary dropped', run(c, req(113, 0, struct.pack('<I', 0))) == NOOP)
 check('KillClient of a host application dropped', run(c, req(113, 0, struct.pack('<I', OTHER))) == NOOP)

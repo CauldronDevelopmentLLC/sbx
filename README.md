@@ -38,9 +38,10 @@ sbx create npm -r cli npm
 sbx run npm install
 ```
 
-Each sandbox has its own home in ``~/.local/share/sbx/<name>`` and config in
-``~/.config/sbx/<name>/config.yml``.  Sandboxes made from the same template
-share one read-only install of the program in ``~/.local/share/sbx-apps``.
+Each sandbox has its own home in ``~/.local/share/sbx/containers/<name>`` and
+config in ``~/.config/sbx/containers/<name>/config.yml``.  Sandboxes made from
+the same template share one read-only install of the program, an image in
+``~/.local/share/sbx/images``.
 ``sbx list-rules`` shows the rules available, see
 [Configuration](docs/configuration.md) to write your own.
 
@@ -77,12 +78,17 @@ On Debian, or the equivalent packages on other distributions:
     sudo make install
 
 ``util-linux`` 2.39 or later is needed.  ``make install`` installs ``sbx``,
-``sbx-portal`` and ``sbx-x11`` in ``/usr/local/bin`` and the default rules,
-``global.yml``, and templates in ``/usr/local/lib/sbx`` and bash and fish
-completions, or under ``$PREFIX``.  To change the default rules, copy
-``global.yml`` to ``~/.config/sbx/``, which is then used instead.  Install by
-copying, never by linking to a checkout which a sandbox can write.  ``make
-check`` runs the tests.
+``sbx-portal`` and ``sbx-x11`` in ``/usr/local/bin``, templates, including the
+default rules in ``global``, and images in ``/usr/local/lib/sbx`` and bash and
+fish completions, or under ``$PREFIX``.  Install by copying, never by linking
+to a checkout which a sandbox can write.  ``make check`` runs the tests.
+
+To upgrade from the layout before templates were imported, move each
+``~/.config/sbx/<name>`` to ``~/.config/sbx/containers/<name>``, each
+``~/.local/share/sbx/<name>`` to ``~/.local/share/sbx/containers/<name>`` and
+``~/.local/share/sbx-apps/*`` to ``~/.local/share/sbx/images/``.  Then replace
+each ``config.yml`` made from a template with ``imports: [<template>]``, and
+in the others ``imports: [$SBX_LIB/global.yml]`` with ``imports: [global]``.
 
 On X11, see also [X11](docs/security.md#x11) on removing the X server's
 access grant by user.
@@ -102,8 +108,7 @@ access grant by user.
     edit         edit sandbox config with $EDITOR
     template     create a template from an existing sandbox
 
-See ``sbx <subcommand> --help``.  ``-r`` replaces the default rules and may
-be repeated.  Options for the command follow ``--``, e.g.
+See ``sbx <subcommand> --help``.  ``-r`` adds rules and may be repeated.  Options for the command follow ``--``, e.g.
 ``sbx run npm -- --help``.
 
 ``sbx run`` returns the command's exit code, unless the ``post-hook`` fails.
@@ -119,11 +124,13 @@ program a template installed.
 ``sbx rename <old> <new>`` renames a sandbox's config and home.  Files shared
 with it through the file dialog are not carried over.
 
-``sbx create <name> -t <template>`` creates a sandbox from a template, as is,
-so ``-r`` and a command are not allowed.  Templates are looked up in
-``~/.local/share/sbx-templates``, then in those installed with sbx, so yours
-can replace them.  ``sbx template <name> <template>`` saves a sandbox's
-config directory and home as a template there.
+``sbx create <name> -t <template>`` creates a sandbox importing a template,
+with ``-r`` and a command added.  Without ``-t`` it imports ``default``, or
+with ``-r``, only the rules given.  Templates are looked up in
+``~/.config/sbx/templates``, then in those installed with sbx, so yours can
+replace them.  ``sbx template <name> <template>`` saves a sandbox's config
+directory as a template there and its home as an image new sandboxes made
+from it start with, see [Templates](docs/configuration.md#templates).
 
 ## Documentation
 

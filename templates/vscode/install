@@ -1,5 +1,5 @@
 #!/bin/bash
-# Installs or updates Visual Studio Code in $SBX_APPS/vscode
+# Installs or updates Visual Studio Code in $SBX_IMAGES/vscode
 app=vscode
 . "$SBX_LIB/templates/app.sh"
 
